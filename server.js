@@ -192,6 +192,47 @@ async function deploy(id, files) {
   return { mode, ok: false, detail: "未知发布模式: " + mode };
 }
 
+/* ---------- 应用列表 ---------- */
+function listApps() {
+  if (!fs.existsSync(APPS_DIR)) return [];
+  const apps = [];
+  for (const id of fs.readdirSync(APPS_DIR)) {
+    if (!/^[a-z0-9]+$/i.test(id)) continue;
+    const dir = path.join(APPS_DIR, id);
+    if (!dir.startsWith(APPS_DIR) || !fs.statSync(dir).isDirectory()) continue;
+    const indexHtml = path.join(dir, "index.html");
+    if (!fs.existsSync(indexHtml)) continue;
+    let title = "未命名应用", version = 1, updatedAt = null;
+    const sp = path.join(dir, "session.json");
+    if (fs.existsSync(sp)) {
+      try {
+        const s = JSON.parse(fs.readFileSync(sp, "utf8"));
+        if (s.title) title = s.title;
+        if (typeof s.version === "number") version = s.version;
+        if (s.updatedAt) updatedAt = s.updatedAt;
+      } catch {}
+    }
+    if (!title || title === "未命名应用") {
+      try { title = extractTitle(fs.readFileSync(indexHtml, "utf8")); } catch {}
+    }
+    if (!updatedAt) {
+      try { updatedAt = fs.statSync(indexHtml).mtime.toISOString(); } catch {}
+    }
+    let size = 0;
+    for (const f of ["index.html", "manifest.json", "sw.js", "icon.svg"]) {
+      try { size += fs.statSync(path.join(dir, f)).size; } catch {}
+    }
+    const vDir = path.join(dir, "versions");
+    let versions = 0;
+    if (fs.existsSync(vDir)) {
+      try { versions = fs.readdirSync(vDir).filter((f) => /^v\d+\.html$/.test(f)).length; } catch {}
+    }
+    apps.push({ id, title, version, versions, updatedAt, size, url: BASE_URL + "/apps/" + id + "/" });
+  }
+  apps.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  return apps;
+}
+
 /* ---------- 生成主流程 ---------- */
 async function handleGenerate(req, res, bodyText, ip) {
   let body;
@@ -367,6 +408,24 @@ const server = http.createServer((req, res) => {
       baseUrl: BASE_URL, model: MODEL,
       hasKey: !!DEEPSEEK_KEY, authRequired: !!API_TOKEN, rateLimitPerHour: RATE_LIMIT,
     });
+  }
+  // 应用列表（需口令）
+  if (req.method === "GET" && p === "/api/apps") {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    return sendJson(res, 200, { apps: listApps() });
+  }
+  // 删除应用（需口令）
+  const delMatch = p.match(/^\/api\/apps\/([a-z0-9]+)$/i);
+  if (req.method === "DELETE" && delMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const id = delMatch[1];
+    const dir = path.join(APPS_DIR, id);
+    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(dir)) return sendJson(res, 404, { error: "应用不存在" });
+    fs.rmSync(dir, { recursive: true, force: true });
+    console.log("[" + new Date().toISOString() + "] 删除 " + id + " · ip=" + clientIp(req));
+    return sendJson(res, 200, { ok: true });
   }
   if (req.method === "POST" && p === "/api/generate") {
     let bodyText = "";
