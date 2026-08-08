@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon.svg">
+<title>PWA 工坊 · 聊天生成小应用</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--card:#1c2330;--line:#2a3342;--txt:#e6edf3;--dim:#8b98a8;--acc:#4f8cff;--ok:#2fbf71;--err:#ff5f6d}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;overscroll-behavior:none}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+header .logo{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4f8cff,#7a5cff);display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:15px;flex-shrink:0}
+header h1{font-size:16px;margin:0}
+header .tag{margin-left:auto;font-size:12px;color:var(--dim);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 10px;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+header .gear{margin-left:8px;width:32px;height:32px;border-radius:9px;background:var(--card);border:1px solid var(--line);color:var(--dim);font-size:15px;cursor:pointer;flex-shrink:0}
+#chat{flex:1;overflow-y:auto;padding:14px 16px;padding-bottom:calc(14px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:12px}
+.msg{max-width:84%;padding:11px 14px;border-radius:14px;line-height:1.65;font-size:14px;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:var(--acc);color:#fff;border-bottom-right-radius:4px}
+.msg.bot{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-bottom-left-radius:4px}
+.msg.bot.streaming{border-color:var(--acc)}
+.msg .cur{display:inline-block;width:8px;height:16px;background:var(--acc);vertical-align:-2px;margin-left:2px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.msg.err{background:rgba(255,95,109,.1);border-color:var(--err);color:var(--err)}
+.hint{font-size:12.5px;color:var(--dim);background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:10px 13px;line-height:1.7}
+#result{margin-top:4px}
+.result-card{background:var(--panel);border:1px solid var(--acc);border-radius:14px;padding:14px}
+.result-card h3{margin:0 0 8px;font-size:15px}
+.row{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}
+.urlbox{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:13px;color:var(--acc);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button{font-family:inherit;font-size:13px;border:none;border-radius:9px;padding:8px 12px;background:var(--card);color:var(--txt);border:1px solid var(--line);cursor:pointer}
+button:active{transform:scale(.97)}
+button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
+.detail{font-size:12.5px;color:var(--dim);margin-top:8px;line-height:1.6}
+.detail.ok{color:var(--ok)}
+.detail.err{color:var(--err)}
+#composer{display:flex;gap:8px;padding:10px 12px;padding-bottom:calc(10px + env(safe-area-inset-bottom));background:var(--panel);border-top:1px solid var(--line);position:sticky;bottom:0}
+#input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 14px;color:var(--txt);font-size:15px;outline:none;font-family:inherit;resize:none;max-height:120px}
+#input:focus{border-color:var(--acc)}
+#send{background:var(--acc);color:#fff;border:none;border-radius:12px;padding:0 18px;font-size:15px;cursor:pointer;flex-shrink:0}
+#send:disabled{opacity:.5;cursor:not-allowed}
+.examples{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.examples button{font-size:12px;border-radius:999px;padding:6px 11px;background:var(--card);border:1px solid var(--line);color:var(--dim)}
+#toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#1f2937;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;z-index:99;display:none;box-shadow:0 4px 16px rgba(0,0,0,.4)}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:100;padding:24px}
+#modal.on{display:flex}
+.mbox{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;width:100%;max-width:360px}
+.mbox h3{margin:0 0 6px;font-size:16px}
+.mbox p{font-size:13px;color:var(--dim);line-height:1.7;margin:0 0 14px}
+.mbox input{width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:11px 12px;color:var(--txt);font-size:14px;outline:none}
+.mbox .row{margin-top:14px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">P</div>
+  <h1>PWA 工坊</h1>
+  <span class="tag" id="target">…</span>
+  <button class="gear" id="gear" title="访问口令">⚙️</button>
+</header>
+<div id="chat">
+  <div class="hint">💡 描述一个小应用，我会用 DeepSeek 生成一个<strong>单文件 PWA</strong>，发布后生成一个<strong>任何人都能立即打开</strong>的网址，手机上还能"安装为应用"。</div>
+  <div class="examples" id="examples">
+    <button data-ex="帮我做一个番茄钟，25分钟专注+5分钟休息，要有进度环和提示音">🍅 番茄钟</button>
+    <button data-ex="做一个记账小工具，按天记录收支，自动算本月结余，本地保存">💰 记账本</button>
+    <button data-ex="做一个成语接龙小游戏，电脑先出题，玩家接龙，判分">🀄 成语接龙</button>
+    <button data-ex="做一个倒计时纪念日小应用，支持添加多个纪念日并显示还剩多少天">🎂 纪念日</button>
+  </div>
+</div>
+<div id="composer">
+  <textarea id="input" placeholder="描述你想要的小应用…（回车发送，Shift+回车换行）"></textarea>
+  <button id="send">发送</button>
+</div>
+<div id="toast"></div>
+<div id="modal">
+  <div class="mbox">
+    <h3>访问口令</h3>
+    <p>生成应用会消耗 DeepSeek 额度。设置口令后，只有知道口令的人能在这里生成应用；打开已生成的应用不受影响。</p>
+    <input id="tokenInput" type="password" placeholder="输入访问口令（留空则关闭）">
+    <div class="row">
+      <button id="tokenSave" class="pri">保存</button>
+      <button id="tokenClose">取消</button>
+    </div>
+  </div>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
+let busy = false, token = localStorage.getItem("pw_token") || "";
+
+(async () => {
+  try {
+    const cfg = await (await fetch("/api/config")).json();
+    $("#target").textContent = cfg.baseUrl.replace(/^https?:\/\//, "");
+    if (!cfg.hasKey) addMsg("bot err", "⚠️ 服务端还没配置 DeepSeek API Key，请联系管理员。");
+    else if (cfg.authRequired && !token) addMsg("bot", "这个工坊开启了访问口令。点右上角 ⚙️ 输入口令后即可使用。");
+    else addMsg("bot", "好了，直接说需求吧！");
+  } catch (e) { addMsg("bot err", "无法连接服务，请刷新重试。"); }
+})();
+
+function addMsg(kind, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + kind;
+  div.textContent = text;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+function toast(text) {
+  const t = $("#toast");
+  t.textContent = text;
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.display = "none"), 2200);
+}
+
+$("#gear").addEventListener("click", () => {
+  $("#tokenInput").value = token;
+  $("#modal").classList.add("on");
+});
+$("#tokenClose").addEventListener("click", () => $("#modal").classList.remove("on"));
+$("#tokenSave").addEventListener("click", () => {
+  token = $("#tokenInput").value.trim();
+  if (token) localStorage.setItem("pw_token", token);
+  else localStorage.removeItem("pw_token");
+  $("#modal").classList.remove("on");
+  toast(token ? "口令已保存" : "已关闭口令");
+});
+
+document.querySelectorAll("#examples button").forEach((b) => {
+  b.addEventListener("click", () => { input.value = b.dataset.ex; input.focus(); });
+});
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+sendBtn.addEventListener("click", send);
+
+async function send() {
+  const prompt = input.value.trim();
+  if (!prompt || busy) return;
+  busy = true;
+  sendBtn.disabled = true;
+  addMsg("user", prompt);
+  input.value = "";
+  const botMsg = addMsg("bot streaming", "");
+  const cur = document.createElement("span");
+  cur.className = "cur";
+  botMsg.appendChild(cur);
+  let acc = "";
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = "Bearer " + token;
+    const resp = await fetch("/api/generate", { method: "POST", headers, body: JSON.stringify({ prompt }) });
+    if (resp.status === 401) {
+      addMsg("bot err", "❌ 访问口令不对，点右上角 ⚙️ 重新填写。");
+      botMsg.remove();
+      return;
+    }
+    if (resp.status === 429) {
+      const e = await resp.json().catch(() => ({}));
+      addMsg("bot err", "❌ " + (e.error || "请求太频繁"));
+      botMsg.remove();
+      return;
+    }
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.error || "HTTP " + resp.status);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const evt = JSON.parse(part.slice(6));
+        if (evt.type === "token") {
+          acc += evt.text;
+          botMsg.textContent = acc;
+          botMsg.appendChild(cur);
+          chat.scrollTop = chat.scrollHeight;
+        } else if (evt.type === "status") {
+          addMsg("bot", "⏳ " + evt.text);
+        } else if (evt.type === "error") {
+          throw new Error(evt.message);
+        } else if (evt.type === "done") {
+          botMsg.classList.remove("streaming");
+          botMsg.textContent = acc;
+          showResult(evt.result);
+        }
+      }
+    }
+    if (!acc && !document.querySelector(".result-card")) throw new Error("流意外结束，请重试");
+  } catch (e) {
+    botMsg.classList.remove("streaming");
+    botMsg.textContent = acc || "";
+    addMsg("bot err", "❌ " + e.message);
+  } finally {
+    busy = false;
+    sendBtn.disabled = false;
+  }
+}
+
+function showResult(r) {
+  const wrap = document.createElement("div");
+  wrap.id = "result";
+  const depl = r.deploy && r.deploy.ok
+    ? '<div class="detail ok">✅ ' + (r.deploy.detail || "已发布") + "，任何有链接的人都能立即打开</div>"
+    : '<div class="detail err">⚠️ 发布未完成：' + (r.deploy ? r.deploy.detail : "") + "（文件已保存在本地）</div>";
+  wrap.innerHTML = `
+    <div class="result-card">
+      <h3>🎉「${escapeHtml(r.title)}」已生成</h3>
+      <div class="row">
+        <div class="urlbox">${escapeHtml(r.url)}</div>
+      </div>
+      <div class="row">
+        <button class="pri" id="copyUrl">复制网址</button>
+        <button class="ok" id="shareUrl">分享</button>
+        <button id="openUrl">打开</button>
+      </div>
+      ${depl}
+      <div class="detail">💾 数据存在访客自己的浏览器 · 可"安装为应用"当桌面 App 用</div>
+    </div>`;
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+  wrap.querySelector("#copyUrl").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(r.url); toast("网址已复制 ✓"); }
+    catch { toast("复制失败，请长按网址手动复制"); }
+  });
+  wrap.querySelector("#shareUrl").addEventListener("click", async () => {
+    const text = "我用 AI 生成了一个小应用「" + r.title + "」，点开就能用：" + r.url;
+    if (navigator.share) {
+      try { await navigator.share({ title: r.title, text, url: r.url }); return; } catch {}
+    }
+    try { await navigator.clipboard.writeText(text); toast("已复制，去微信/浏览器发给朋友吧 ✓"); }
+    catch { toast("复制失败，请手动复制链接"); }
+  });
+  wrap.querySelector("#openUrl").addEventListener("click", () => window.open(r.url, "_blank"));
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 聊天界面自身的 Service Worker：缓存外壳；/apps/ 下的子应用一律不拦截
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+# 用法：docker compose up -d
+services:
+  pwa-studio:
+    build: .
+    container_name: pwa-studio
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      DEEPSEEK_API_KEY: "sk-xxx"          # 改成你的
+      API_TOKEN: "change-me"              # 访问口令（生成应用需要）
+      RATE_LIMIT_PER_HOUR: "30"
+      BASE_URL: "https://freexlib.com"
+    volumes:
+      - ./apps-data:/app/apps-data

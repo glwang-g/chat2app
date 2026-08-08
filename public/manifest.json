@@ -1,0 +1,15 @@
+{
+  "name": "PWA 工坊 · 聊天生成小应用",
+  "short_name": "PWA 工坊",
+  "description": "聊天让 DeepSeek 生成单文件 PWA，发布后任何人都能立即打开",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
