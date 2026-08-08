@@ -1,7 +1,7 @@
 {
-  "name": "PWA 工坊 · 聊天生成小应用",
-  "short_name": "PWA 工坊",
-  "description": "聊天让 DeepSeek 生成单文件 PWA，发布后任何人都能立即打开",
+  "name": "Chat2App · 聊天生成小应用",
+  "short_name": "Chat2App",
+  "description": "聊天让大模型生成单文件小应用，发布后任何人都能立即打开",
   "lang": "zh-CN",
   "start_url": "/",
   "scope": "/",

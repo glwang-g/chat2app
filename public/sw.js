@@ -1,6 +1,6 @@
-/* PWA 工坊 · 聊天界面自身的 Service Worker
+/* Chat2App · 聊天界面自身的 Service Worker
    只缓存本聊天工具的壳；/apps/ 下的子应用完全放行，不缓存不拦截 */
-const C = "pw-studio-chat-v1";
+const C = "chat2app-v1";
 const SHELL = ["/", "/index.html", "/manifest.json", "/icon.svg"];
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(C).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

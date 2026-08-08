@@ -1,8 +1,8 @@
 # 用法：docker compose up -d
 services:
-  pwa-studio:
+  chat2app:
     build: .
-    container_name: pwa-studio
+    container_name: chat2app
     restart: unless-stopped
     ports:
       - "8787:8787"

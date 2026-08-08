@@ -1,4 +1,4 @@
-# PWA 工坊 · 云端版
+# Chat2App · 云端版
 FROM node:22-alpine
 WORKDIR /app
 COPY server.js config.json ./

@@ -1,4 +1,4 @@
-# /etc/nginx/conf.d/pwa-studio.conf
+# /etc/nginx/conf.d/chat2app.conf
 # 假设你用 certbot 给 freexlib.com 配好了 HTTPS
 server {
     listen 80;

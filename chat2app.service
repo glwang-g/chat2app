@@ -1,0 +1,15 @@
+[Unit]
+Description=Chat2App - chat to generate and host mini apps
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/chat2app
+EnvironmentFile=/opt/chat2app/.env
+ExecStart=/usr/bin/node /opt/chat2app/server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

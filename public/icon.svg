@@ -3,5 +3,5 @@
     <stop offset="0" stop-color="#4f8cff"/><stop offset="1" stop-color="#7a5cff"/>
   </linearGradient></defs>
   <rect width="512" height="512" rx="112" fill="url(#g)"/>
-  <text x="256" y="344" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="280" font-weight="700" fill="#fff" text-anchor="middle">P</text>
+  <text x="256" y="344" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="280" font-weight="700" fill="#fff" text-anchor="middle">C</text>
 </svg>

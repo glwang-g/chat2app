@@ -1,4 +1,4 @@
-# PWA 工坊 · 云端版
+# Chat2App · 云端版
 
 移动端聊天 → DeepSeek 流式生成单文件 PWA → 自动发布到 `https://freexlib.com/apps/<id>/`，
 **任何人拿到链接都能立即打开**，手机/桌面浏览器可"安装为应用"。
@@ -21,10 +21,10 @@ node server.js              # http://127.0.0.1:8787
 
 ```bash
 # 1. 把整个目录传到服务器（或用 git）
-scp -r pwa-studio root@你的服务器:/opt/
+scp -r chat2app root@你的服务器:/opt/
 
 # 2. 服务器上
-cd /opt/pwa-studio
+cd /opt/chat2app
 cp .env.example .env        # 填好 DEEPSEEK_API_KEY / API_TOKEN / BASE_URL
 docker compose up -d --build
 ```
@@ -34,17 +34,17 @@ docker compose up -d --build
 ```bash
 # 服务器上
 apt install -y nodejs       # 需要 Node 18+（建议用 nodesource 装 20/22 LTS）
-mkdir -p /opt/pwa-studio && cp -r server.js public config.json /opt/pwa-studio/
-cp .env.example /opt/pwa-studio/.env   # 填好
-cp pwa-studio.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now pwa-studio
+mkdir -p /opt/chat2app && cp -r server.js public config.json /opt/chat2app/
+cp .env.example /opt/chat2app/.env   # 填好
+cp chat2app.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now chat2app
 ```
 
 ### 3. Nginx + HTTPS（必须，PWA 需要 HTTPS）
 
 ```bash
 apt install -y nginx certbot python3-certbot-nginx
-cp nginx.conf.example /etc/nginx/conf.d/pwa-studio.conf   # 改好 server_name
+cp nginx.conf.example /etc/nginx/conf.d/chat2app.conf   # 改好 server_name
 certbot --nginx -d freexlib.com                            # 自动签发并续期 HTTPS
 systemctl reload nginx
 ```
@@ -72,7 +72,7 @@ systemctl reload nginx
 server.js            云端后端：DeepSeek 流式代理 + PWA 打包 + 发布 + 限流 + 口令
 public/              手机聊天界面（PWA：manifest + sw + icon）
 apps-data/<id>/      生成的应用（index.html / manifest.json / sw.js / icon.svg）
-Dockerfile / docker-compose.yml / pwa-studio.service / nginx.conf.example
+Dockerfile / docker-compose.yml / chat2app.service / nginx.conf.example
 ```
 
 ## 安全说明
