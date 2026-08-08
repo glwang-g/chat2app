@@ -116,11 +116,12 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
 const $ = (s) => document.querySelector(s);
 const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
 let busy = false, token = localStorage.getItem("pw_token") || "";
-let sessionId = null, appVersion = 0;
+let sessionId = null, appVersion = 0, authRequired = false;
 
 (async () => {
   try {
     const cfg = await (await fetch("/api/config")).json();
+    authRequired = !!cfg.authRequired;
     $("#target").textContent = cfg.baseUrl.replace(/^https?:\/\//, "");
     if (!cfg.hasKey) addMsg("bot err", "⚠️ 服务端还没配置 DeepSeek API Key，请联系管理员。");
     else if (cfg.authRequired && !token) addMsg("bot", "这个工坊开启了访问口令。点右上角 ⚙️ 输入口令后即可使用。");
@@ -159,7 +160,7 @@ $("#tokenSave").addEventListener("click", () => {
 
 /* ---------- 应用列表 ---------- */
 $("#appsBtn").addEventListener("click", () => {
-  if (!token) { toast("请先点 ⚙️ 输入访问口令"); return; }
+  if (authRequired && !token) { toast("请先点 ⚙️ 输入访问口令"); return; }
   $("#appsModal").classList.add("on");
   loadApps();
 });
@@ -169,7 +170,9 @@ async function loadApps() {
   const body = $("#appsBody");
   body.innerHTML = '<div class="app-empty">加载中…</div>';
   try {
-    const resp = await fetch("/api/apps", { headers: { Authorization: "Bearer " + token } });
+    const headers = {};
+    if (token) headers.Authorization = "Bearer " + token;
+    const resp = await fetch("/api/apps", { headers });
     if (resp.status === 401) {
       body.innerHTML = '<div class="app-empty">访问口令不对，请点 ⚙️ 重新填写。</div>';
       return;
@@ -231,7 +234,9 @@ function renderApps(apps) {
         return;
       }
       try {
-        const resp = await fetch("/api/apps/" + a.id, { method: "DELETE", headers: { Authorization: "Bearer " + token } });
+        const hdrs = {};
+        if (token) hdrs.Authorization = "Bearer " + token;
+        const resp = await fetch("/api/apps/" + a.id, { method: "DELETE", headers: hdrs });
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         item.remove();
         toast("已删除 " + a.title);
@@ -300,9 +305,7 @@ async function send() {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      const parts = buf.split("
-
-");
+      const parts = buf.split("\n\n");
       buf = parts.pop();
       for (const part of parts) {
         if (!part.startsWith("data: ")) continue;
