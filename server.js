@@ -56,6 +56,18 @@ const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述�
 7. 页面要包含 <title>、<meta name="theme-color">、<meta name="apple-mobile-web-app-capable" content="yes"> 等 PWA 友好标签；不要包含 <link rel="manifest">（工具会自动添加）。
 8. 尽量简洁但完整。`;
 
+/* ---------- 迭代修改提示词 ---------- */
+const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户已经有一个小应用（完整 HTML 见下），他会继续提修改要求。
+
+硬性要求：
+1. 基于现有 HTML 修改，**保留所有已有功能和数据**（localStorage 的键名不要改）。
+2. 输出**只能**是一个完整的 HTML 文档（以 <!DOCTYPE html> 开头），不要任何解释文字，不要 markdown 围栏。
+3. 所有 CSS 和 JS 必须内联，禁止引用外部文件/CDN 框架。
+4. 移动端优先，UI 精致现代，界面文案中文。
+5. 必须完整可用，禁止占位符、TODO、假数据。
+6. 如果新要求与旧功能冲突，以新要求为准，但尽量保留有用的旧功能。
+7. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">（工具会自动添加）。`;
+
 /* ---------- 工具函数 ---------- */
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -124,7 +136,8 @@ function extractHtml(raw) {
   return s;
 }
 function extractTitle(html) {
-  const m = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+  // 宽容匹配：模型偶尔会输出 </title> 缺斜杠（如 <title>x</title> 或 <title>xtitle>）
+  const m = html.match(/<title[^>]*>([\s\S]*?)(?:<\/?title>|title>)/i);
   return m ? m[1].trim().replace(/\s+/g, " ") : "未命名应用";
 }
 function genId() {
@@ -192,6 +205,21 @@ async function handleGenerate(req, res, bodyText, ip) {
   const rateErr = checkRate(ip);
   if (rateErr) return sendJson(res, 429, { error: rateErr });
 
+  // 会话：传了有效 sessionId -> 在已有应用上迭代修改；否则新建应用
+  const sessionId = (body.sessionId || "").trim();
+  let isIteration = false;
+  let existingHtml = null;
+  if (sessionId) {
+    if (!/^[a-z0-9]+$/i.test(sessionId)) return sendJson(res, 400, { error: "无效的会话" });
+    const existingPath = path.join(APPS_DIR, sessionId, "index.html");
+    if (existingPath.startsWith(APPS_DIR) && fs.existsSync(existingPath)) {
+      isIteration = true;
+      existingHtml = fs.readFileSync(existingPath, "utf8");
+    } else {
+      return sendJson(res, 400, { error: "会话不存在，请重新开始" });
+    }
+  }
+
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache",
@@ -200,11 +228,16 @@ async function handleGenerate(req, res, bodyText, ip) {
   });
   const sse = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
 
-  sse({ type: "status", text: "正在请求 DeepSeek…" });
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: "需求：\n" + prompt },
-  ];
+  sse({ type: "status", text: isIteration ? "正在根据你的要求修改应用…" : "正在创建应用…" });
+  const messages = isIteration
+    ? [
+        { role: "system", content: ITERATE_SYSTEM_PROMPT },
+        { role: "user", content: "现有应用的完整 HTML：\n```html\n" + existingHtml + "\n```\n\n用户的修改要求：\n" + prompt },
+      ]
+    : [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: "需求：\n" + prompt },
+      ];
   let upstream;
   try {
     upstream = await fetch(DEEPSEEK_URL, {
@@ -229,18 +262,26 @@ async function handleGenerate(req, res, bodyText, ip) {
   let raw = "";
   const decoder = new TextDecoder();
   let lastFlush = Date.now();
+  // 关键：SSE 事件可能被 TCP 拆分到多次 read()，必须跨读取缓冲，
+  // 攒够完整的 "\n\n" 分隔事件再解析，否则半个 JSON 会整块丢失。
+  let sseBuf = "";
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      parseSSE(decoder.decode(value, { stream: true }), (j) => {
-        const delta = j.choices && j.choices[0] && j.choices[0].delta;
-        if (delta && delta.content) {
-          raw += delta.content;
-          sse({ type: "token", text: delta.content });
-          lastFlush = Date.now();
-        }
-      });
+      sseBuf += decoder.decode(value, { stream: true });
+      const parts = sseBuf.split("\n\n");
+      sseBuf = parts.pop();
+      for (const part of parts) {
+        parseSSE(part, (j) => {
+          const delta = j.choices && j.choices[0] && j.choices[0].delta;
+          if (delta && delta.content) {
+            raw += delta.content;
+            sse({ type: "token", text: delta.content });
+            lastFlush = Date.now();
+          }
+        });
+      }
       if (Date.now() - lastFlush > 15000) {
         sse({ type: "ping" });
         lastFlush = Date.now();
@@ -258,24 +299,38 @@ async function handleGenerate(req, res, bodyText, ip) {
     return;
   }
 
-  sse({ type: "status", text: "正在打包并发布…" });
+  sse({ type: "status", text: isIteration ? "正在更新应用…" : "正在打包并发布…" });
   const html = extractHtml(raw);
   const title = extractTitle(html);
-  const id = genId();
+  const id = isIteration ? sessionId : genId();
   const appDir = path.join(APPS_DIR, id);
   fs.mkdirSync(appDir, { recursive: true });
+
+  // 版本管理：迭代前把当前版本备份到 versions/
+  const sessionPath = path.join(appDir, "session.json");
+  let curVersion = 0;
+  if (fs.existsSync(sessionPath)) {
+    try { curVersion = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 0; } catch {}
+  }
+  const newVersion = curVersion + 1;
+  if (isIteration && curVersion > 0) {
+    const vDir = path.join(appDir, "versions");
+    fs.mkdirSync(vDir, { recursive: true });
+    fs.copyFileSync(path.join(appDir, "index.html"), path.join(vDir, "v" + curVersion + ".html"));
+  }
   const files = ["index.html", "manifest.json", "sw.js", "icon.svg"];
   fs.writeFileSync(path.join(appDir, "index.html"), html);
   fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
   fs.writeFileSync(path.join(appDir, "sw.js"), SW_JS);
   fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
-  console.log("[" + new Date().toISOString() + "] 生成 " + id + " · " + title + " · ip=" + ip);
+  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString() }));
+  console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
 
   const result = await deploy(id, files);
   sse({
     type: "done",
     result: {
-      id, title,
+      id, sessionId: id, title, version: newVersion, isIteration,
       url: BASE_URL + "/apps/" + id + "/",
       files, deploy: result,
     },

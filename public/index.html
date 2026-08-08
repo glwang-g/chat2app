@@ -66,7 +66,7 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
   <button class="gear" id="gear" title="访问口令">⚙️</button>
 </header>
 <div id="chat">
-  <div class="hint">💡 描述一个小应用，我会让大模型生成一个<strong>单文件 PWA</strong>，发布后生成一个<strong>任何人都能立即打开</strong>的网址，手机上还能"安装为应用"。</div>
+  <div class="hint">💡 先描述第一个需求 → 生成应用初版；<strong>之后继续聊天，会在同一个应用上持续修改（网址不变）</strong>，直到你满意。生成的应用任何人都能立即打开，手机上还能"安装为应用"。</div>
   <div class="examples" id="examples">
     <button data-ex="帮我做一个番茄钟，25分钟专注+5分钟休息，要有进度环和提示音">🍅 番茄钟</button>
     <button data-ex="做一个记账小工具，按天记录收支，自动算本月结余，本地保存">💰 记账本</button>
@@ -94,6 +94,7 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
 const $ = (s) => document.querySelector(s);
 const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
 let busy = false, token = localStorage.getItem("pw_token") || "";
+let sessionId = null, appVersion = 0;
 
 (async () => {
   try {
@@ -101,7 +102,7 @@ let busy = false, token = localStorage.getItem("pw_token") || "";
     $("#target").textContent = cfg.baseUrl.replace(/^https?:\/\//, "");
     if (!cfg.hasKey) addMsg("bot err", "⚠️ 服务端还没配置 DeepSeek API Key，请联系管理员。");
     else if (cfg.authRequired && !token) addMsg("bot", "这个工坊开启了访问口令。点右上角 ⚙️ 输入口令后即可使用。");
-    else addMsg("bot", "好了，直接说需求吧！");
+    else addMsg("bot", "描述你的第一个需求，我来生成应用的初版；之后继续聊，我会在同一个应用上不断修改，直到你满意。");
   } catch (e) { addMsg("bot err", "无法连接服务，请刷新重试。"); }
 })();
 
@@ -142,6 +143,12 @@ input.addEventListener("keydown", (e) => {
 });
 sendBtn.addEventListener("click", send);
 
+function setInputPlaceholder() {
+  input.placeholder = sessionId
+    ? "继续描述修改要求…（会更新到当前应用）"
+    : "描述你想要的小应用…（回车发送，Shift+回车换行）";
+}
+
 async function send() {
   const prompt = input.value.trim();
   if (!prompt || busy) return;
@@ -157,7 +164,9 @@ async function send() {
   try {
     const headers = { "Content-Type": "application/json" };
     if (token) headers.Authorization = "Bearer " + token;
-    const resp = await fetch("/api/generate", { method: "POST", headers, body: JSON.stringify({ prompt }) });
+    const body = { prompt };
+    if (sessionId) body.sessionId = sessionId;
+    const resp = await fetch("/api/generate", { method: "POST", headers, body: JSON.stringify(body) });
     if (resp.status === 401) {
       addMsg("bot err", "❌ 访问口令不对，点右上角 ⚙️ 重新填写。");
       botMsg.remove();
@@ -180,7 +189,9 @@ async function send() {
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\n\n");
+      const parts = buf.split("
+
+");
       buf = parts.pop();
       for (const part of parts) {
         if (!part.startsWith("data: ")) continue;
@@ -201,7 +212,7 @@ async function send() {
         }
       }
     }
-    if (!acc && !document.querySelector(".result-card")) throw new Error("流意外结束，请重试");
+    if (!acc && !document.getElementById("result")) throw new Error("流意外结束，请重试");
   } catch (e) {
     botMsg.classList.remove("streaming");
     botMsg.textContent = acc || "";
@@ -213,14 +224,25 @@ async function send() {
 }
 
 function showResult(r) {
-  const wrap = document.createElement("div");
-  wrap.id = "result";
+  sessionId = r.sessionId;
+  appVersion = r.version;
+  setInputPlaceholder();
+  let wrap = document.getElementById("result");
+  const isUpdate = r.isIteration && !!wrap;
   const depl = r.deploy && r.deploy.ok
     ? '<div class="detail ok">✅ ' + (r.deploy.detail || "已发布") + "，任何有链接的人都能立即打开</div>"
     : '<div class="detail err">⚠️ 发布未完成：' + (r.deploy ? r.deploy.detail : "") + "（文件已保存在本地）</div>";
+  const head = isUpdate
+    ? "✅ 「" + escapeHtml(r.title) + "」已更新到 v" + r.version
+    : "🎉 「" + escapeHtml(r.title) + "」初版已生成";
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.id = "result";
+    chat.appendChild(wrap);
+  }
   wrap.innerHTML = `
     <div class="result-card">
-      <h3>🎉「${escapeHtml(r.title)}」已生成</h3>
+      <h3>${head}</h3>
       <div class="row">
         <div class="urlbox">${escapeHtml(r.url)}</div>
       </div>
@@ -230,9 +252,9 @@ function showResult(r) {
         <button id="openUrl">打开</button>
       </div>
       ${depl}
-      <div class="detail">💾 数据存在访客自己的浏览器 · 可"安装为应用"当桌面 App 用</div>
+      <div class="detail">💬 继续聊天，我会在<strong>同一个链接</strong>上继续更新这个应用，直到你满意为止。</div>
+      <div class="row"><button id="newApp">🆕 新建应用</button></div>
     </div>`;
-  chat.appendChild(wrap);
   chat.scrollTop = chat.scrollHeight;
   wrap.querySelector("#copyUrl").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(r.url); toast("网址已复制 ✓"); }
@@ -247,6 +269,14 @@ function showResult(r) {
     catch { toast("复制失败，请手动复制链接"); }
   });
   wrap.querySelector("#openUrl").addEventListener("click", () => window.open(r.url, "_blank"));
+  wrap.querySelector("#newApp").addEventListener("click", () => {
+    sessionId = null;
+    appVersion = 0;
+    const rw = document.getElementById("result");
+    if (rw) rw.remove();
+    setInputPlaceholder();
+    addMsg("bot", "好的，开始一个新应用。描述你的需求吧！");
+  });
 }
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
