@@ -24,5 +24,9 @@ server {
         # 关键：关掉缓冲，SSE 流式输出才能实时到浏览器
         proxy_buffering off;
         proxy_cache off;
+        # 生成可能较久，放宽超时（默认 60s 会掐断长生成，导致前端 Load failed）
+        proxy_connect_timeout 30s;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
 }
