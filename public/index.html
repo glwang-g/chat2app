@@ -130,7 +130,33 @@ let sessionId = null, appVersion = 0, authRequired = false;
     else if (cfg.authRequired && !token) addMsg("bot", "这个工坊开启了访问口令。点右上角 ⚙️ 输入口令后即可使用。");
     else addMsg("bot", "描述你的第一个需求，我来生成应用的初版；之后继续聊，我会在同一个应用上不断修改，直到你满意。");
   } catch (e) { addMsg("bot err", "无法连接服务，请刷新重试。"); }
+  const saved = localStorage.getItem("chat2app_session");
+  if (saved) restoreSession(saved);
 })();
+
+// 恢复上次会话：回到同一个应用的上下文继续改
+async function restoreSession(id) {
+  try {
+    const headers = {};
+    if (token) headers.Authorization = "Bearer " + token;
+    const resp = await fetch("/api/apps/" + id, { headers });
+    if (resp.status === 401) {
+      addMsg("bot", "↩️ 检测到上次未完成的应用会话，输入口令（⚙️）后刷新即可恢复。");
+      return;
+    }
+    if (!resp.ok) { localStorage.removeItem("chat2app_session"); return; }
+    const { app } = await resp.json();
+    sessionId = app.id;
+    appVersion = app.version;
+    if (Array.isArray(app.history) && app.history.length) {
+      for (const h of app.history) addMsg("user", h);
+    }
+    addMsg("bot", "↩️ 已恢复上次的会话：**" + app.title + "** v" + app.version + "，继续描述修改要求即可，预览会接着更新。");
+    showResult({ id: app.id, sessionId: app.id, title: app.title, version: app.version, isIteration: false, url: app.url, deploy: { ok: true, detail: "已恢复上次会话，继续聊天即可继续修改" } });
+  } catch (e) {
+    addMsg("bot err", "恢复会话失败：" + e.message);
+  }
+}
 
 function addMsg(kind, text) {
   const div = document.createElement("div");
@@ -337,6 +363,7 @@ async function send() {
 function showResult(r) {
   sessionId = r.sessionId;
   appVersion = r.version;
+  localStorage.setItem("chat2app_session", r.sessionId);
   setInputPlaceholder();
   let wrap = document.getElementById("result");
   const isUpdate = r.isIteration && !!wrap;
@@ -409,6 +436,7 @@ function showResult(r) {
   wrap.querySelector("#newApp").addEventListener("click", () => {
     sessionId = null;
     appVersion = 0;
+    localStorage.removeItem("chat2app_session");
     const rw = document.getElementById("result");
     if (rw) rw.remove();
     setInputPlaceholder();

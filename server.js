@@ -272,9 +272,18 @@ async function handleGenerate(req, res, bodyText, ip) {
   const sse = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
 
   sse({ type: "status", text: isIteration ? "正在根据你的要求修改应用…" : "正在创建应用…" });
+  // 加载该会话的历史需求，让模型记住之前聊过什么
+  let history = [];
+  if (isIteration) {
+    try {
+      const sj = JSON.parse(fs.readFileSync(path.join(APPS_DIR, sessionId, "session.json"), "utf8"));
+      if (Array.isArray(sj.history)) history = sj.history.slice(-10);
+    } catch {}
+  }
   const messages = isIteration
     ? [
         { role: "system", content: ITERATE_SYSTEM_PROMPT },
+        ...history.map((h) => ({ role: "user", content: h })),
         { role: "user", content: "现有应用的完整 HTML：\n```html\n" + existingHtml + "\n```\n\n用户的修改要求：\n" + prompt },
       ]
     : [
@@ -366,7 +375,8 @@ async function handleGenerate(req, res, bodyText, ip) {
   fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
   fs.writeFileSync(path.join(appDir, "sw.js"), SW_JS);
   fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
-  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString() }));
+  const savedHistory = isIteration ? [...history, prompt].slice(-20) : [prompt];
+  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory }));
   console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
 
   const result = await deploy(id, files);
@@ -417,8 +427,31 @@ const server = http.createServer((req, res) => {
     if (authErr) return sendJson(res, 401, { error: authErr });
     return sendJson(res, 200, { apps: listApps() });
   }
-  // 删除应用（需口令）
+  // 应用详情（需口令，含历史，用于恢复会话）
   const delMatch = p.match(/^\/api\/apps\/([a-z0-9]+)$/i);
+  if (req.method === "GET" && delMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const id = delMatch[1];
+    const dir = path.join(APPS_DIR, id);
+    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
+    let title = "未命名应用", version = 1, updatedAt = null, history = [];
+    const sp = path.join(dir, "session.json");
+    if (fs.existsSync(sp)) {
+      try {
+        const sj = JSON.parse(fs.readFileSync(sp, "utf8"));
+        if (sj.title) title = sj.title;
+        if (typeof sj.version === "number") version = sj.version;
+        if (sj.updatedAt) updatedAt = sj.updatedAt;
+        if (Array.isArray(sj.history)) history = sj.history;
+      } catch {}
+    }
+    if (!title || title === "未命名应用") {
+      try { title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8")); } catch {}
+    }
+    return sendJson(res, 200, { app: { id, title, version, versions: 0, updatedAt, history, url: BASE_URL + "/apps/" + id + "/" } });
+  }
+  // 删除应用（需口令）
   if (req.method === "DELETE" && delMatch) {
     const authErr = checkAuth(req);
     if (authErr) return sendJson(res, 401, { error: authErr });
