@@ -68,6 +68,15 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
 .preview{margin-top:10px}
 .preview .pv-label{font-size:12px;color:var(--dim);margin-bottom:6px}
 .preview iframe{width:100%;height:440px;border:1px solid var(--line);border-radius:12px;background:#fff;display:block}
+.preview .pv-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.preview .pv-top .pv-label{font-size:12px;color:var(--dim);flex:1}
+.preview .pv-top button{font-size:12px;padding:6px 12px}
+#pvFull{position:fixed;inset:0;background:#0a0e14;z-index:200;display:none;flex-direction:column}
+#pvFull.on{display:flex}
+#pvFull .pv-head{display:flex;align-items:center;gap:10px;padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));background:var(--panel);border-bottom:1px solid var(--line)}
+#pvFull .pv-head span{flex:1;font-size:14px;font-weight:600;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#pvFull .pv-head button{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font-size:13px}
+#pvFull iframe{flex:1;width:100%;border:none;background:#fff}
 .mbox{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;width:100%;max-width:360px}
 .mbox h3{margin:0 0 6px;font-size:16px}
 .mbox p{font-size:13px;color:var(--dim);line-height:1.7;margin:0 0 14px}
@@ -115,6 +124,13 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
   </div>
   <div class="apps-body" id="appsBody"></div>
 </div>
+<div id="pvFull">
+  <div class="pv-head">
+    <span id="pvFullTitle">应用预览</span>
+    <button id="pvFullClose">✕ 关闭</button>
+  </div>
+  <iframe id="pvFullFrame" src="about:blank"></iframe>
+</div>
 <script>
 const $ = (s) => document.querySelector(s);
 const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
@@ -133,6 +149,20 @@ let sessionId = null, appVersion = 0, authRequired = false;
   const saved = localStorage.getItem("chat2app_session");
   if (saved) restoreSession(saved);
 })();
+
+/* ---------- 全屏预览（事件委托，兼容动态生成的展开按钮） ---------- */
+document.addEventListener("click", (e) => {
+  if (!e.target || !e.target.id) return;
+  if (e.target.id === "pvExpand") {
+    const frame = document.getElementById("appPreview");
+    document.getElementById("pvFullTitle").textContent = "应用预览";
+    document.getElementById("pvFullFrame").src = frame ? frame.src : "about:blank";
+    document.getElementById("pvFull").classList.add("on");
+  } else if (e.target.id === "pvFullClose") {
+    document.getElementById("pvFull").classList.remove("on");
+    document.getElementById("pvFullFrame").src = "about:blank"; // 停止后台播放
+  }
+});
 
 // 恢复上次会话：回到同一个应用的上下文继续改
 async function restoreSession(id) {
@@ -393,7 +423,10 @@ function showResult(r) {
     <div class="result-card">
       <h3>${head}</h3>
       <div class="preview">
-        <div class="pv-label">👀 实时预览（可直接操作，随修改实时刷新）</div>
+        <div class="pv-top">
+          <div class="pv-label">👀 实时预览（可直接操作，随修改实时刷新）</div>
+          <button id="pvExpand">⛶ 展开</button>
+        </div>
         <iframe id="appPreview" src="${escapeHtml(location.origin + "/apps/" + r.id + "/")}" loading="lazy"></iframe>
       </div>
       <div class="row">
