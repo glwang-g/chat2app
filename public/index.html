@@ -65,6 +65,9 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
 .app-item .btns button.del{border-color:var(--err);color:var(--err)}
 .app-item .btns button.del.confirm{background:var(--err);color:#fff;border-color:var(--err)}
 .app-empty{text-align:center;color:var(--dim);font-size:13px;padding:40px 0;line-height:1.8}
+.preview{margin-top:10px}
+.preview .pv-label{font-size:12px;color:var(--dim);margin-bottom:6px}
+.preview iframe{width:100%;height:440px;border:1px solid var(--line);border-radius:12px;background:#fff;display:block}
 .mbox{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;width:100%;max-width:360px}
 .mbox h3{margin:0 0 6px;font-size:16px}
 .mbox p{font-size:13px;color:var(--dim);line-height:1.7;margin:0 0 14px}
@@ -272,10 +275,7 @@ async function send() {
   sendBtn.disabled = true;
   addMsg("user", prompt);
   input.value = "";
-  const botMsg = addMsg("bot streaming", "");
-  const cur = document.createElement("span");
-  cur.className = "cur";
-  botMsg.appendChild(cur);
+  const botMsg = addMsg("bot", "⏳ 正在连接…");
   let acc = "";
   try {
     const headers = { "Content-Type": "application/json" };
@@ -311,17 +311,14 @@ async function send() {
         if (!part.startsWith("data: ")) continue;
         const evt = JSON.parse(part.slice(6));
         if (evt.type === "token") {
-          acc += evt.text;
-          botMsg.textContent = acc;
-          botMsg.appendChild(cur);
-          chat.scrollTop = chat.scrollHeight;
+          acc += evt.text; // 只累计字数，不向用户倾倒代码
         } else if (evt.type === "status") {
-          addMsg("bot", "⏳ " + evt.text);
+          botMsg.textContent = "⏳ " + evt.text;
+          chat.scrollTop = chat.scrollHeight;
         } else if (evt.type === "error") {
           throw new Error(evt.message);
         } else if (evt.type === "done") {
-          botMsg.classList.remove("streaming");
-          botMsg.textContent = acc;
+          botMsg.remove();
           showResult(evt.result);
         }
       }
@@ -349,6 +346,7 @@ function showResult(r) {
   const head = isUpdate
     ? "✅ 「" + escapeHtml(r.title) + "」已更新到 v" + r.version
     : "🎉 「" + escapeHtml(r.title) + "」初版已生成";
+  const rollbackBtn = r.version > 1 ? '<button id="rollback">↩️ 回退到上一版</button>' : "";
   if (!wrap) {
     wrap = document.createElement("div");
     wrap.id = "result";
@@ -357,6 +355,10 @@ function showResult(r) {
   wrap.innerHTML = `
     <div class="result-card">
       <h3>${head}</h3>
+      <div class="preview">
+        <div class="pv-label">👀 实时预览（可直接操作，随修改实时刷新）</div>
+        <iframe id="appPreview" src="${escapeHtml(location.origin + "/apps/" + r.id + "/")}" loading="lazy"></iframe>
+      </div>
       <div class="row">
         <div class="urlbox">${escapeHtml(r.url)}</div>
       </div>
@@ -364,9 +366,10 @@ function showResult(r) {
         <button class="pri" id="copyUrl">复制网址</button>
         <button class="ok" id="shareUrl">分享</button>
         <button id="openUrl">打开</button>
+        ${rollbackBtn}
       </div>
       ${depl}
-      <div class="detail">💬 继续聊天，我会在<strong>同一个链接</strong>上继续更新这个应用，直到你满意为止。</div>
+      <div class="detail">💬 继续聊天，我会在<strong>同一个链接</strong>上继续更新这个应用，预览也会跟着变。</div>
       <div class="row"><button id="newApp">🆕 新建应用</button></div>
     </div>`;
   chat.scrollTop = chat.scrollHeight;
@@ -383,6 +386,26 @@ function showResult(r) {
     catch { toast("复制失败，请手动复制链接"); }
   });
   wrap.querySelector("#openUrl").addEventListener("click", () => window.open(r.url, "_blank"));
+  if (r.version > 1) {
+    wrap.querySelector("#rollback").addEventListener("click", async () => {
+      const hdrs = {};
+      if (token) hdrs.Authorization = "Bearer " + token;
+      try {
+        const resp = await fetch("/api/apps/" + r.id + "/rollback", { method: "POST", headers: hdrs });
+        if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e.error || "HTTP " + resp.status); }
+        const rb = await resp.json();
+        const iframe = wrap.querySelector("#appPreview");
+        if (iframe) iframe.src = location.origin + "/apps/" + r.id + "/?v=" + Date.now();
+        wrap.querySelector("h3").textContent = "↩️ 「" + rb.title + "」已回退到 v" + rb.version;
+        if (rb.version <= 1) { const btn = wrap.querySelector("#rollback"); if (btn) btn.remove(); }
+        r.version = rb.version;
+        r.title = rb.title;
+        toast("已回退到 v" + rb.version);
+      } catch (e) {
+        toast("回退失败：" + e.message);
+      }
+    });
+  }
   wrap.querySelector("#newApp").addEventListener("click", () => {
     sessionId = null;
     appVersion = 0;

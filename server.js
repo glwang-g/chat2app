@@ -44,17 +44,18 @@ const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_HOUR || config.rateLimitPer
 const BASE_URL = (process.env.BASE_URL || config.baseUrl || "https://freexlib.com").replace(/\/+$/, "");
 
 /* ---------- 系统提示词 ---------- */
-const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你需要生成一个**完整的、可直接运行的单个 HTML 文件**。
+const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
 
 硬性要求：
 1. 输出**只能**是一个完整的 HTML 文档（以 <!DOCTYPE html> 开头），不要输出任何解释文字，不要用 markdown 代码围栏。
-2. 所有 CSS 和 JS 必须内联在同一个文件里，禁止引用任何外部文件（包括 CDN 框架）。不用 React/Vue，用原生 HTML/CSS/JS。
-3. 移动端优先：适配手机屏幕（viewport），桌面也能用；UI 要精致、现代。
-4. 所有用户数据用 localStorage 持久化。
-5. 必须是一个完整可用的应用，禁止占位符、TODO、假数据。功能要真的能跑。
-6. 界面文案用中文。
-7. 页面要包含 <title>、<meta name="theme-color">、<meta name="apple-mobile-web-app-capable" content="yes"> 等 PWA 友好标签；不要包含 <link rel="manifest">（工具会自动添加）。
-8. 尽量简洁但完整。`;
+2. 所有 CSS 和 JS 必须内联在同一个文件里，禁止引用任何外部文件/CDN/框架，用原生 HTML/CSS/JS。
+3. 移动端优先：适配手机屏幕（viewport），桌面也能用。
+4. **聚焦一个核心功能，做精做透**，不要堆砌功能；界面要现代精致（深色/渐变/圆角/阴影/动效），像正经 App 而不像演示页。
+5. 所有用户数据用 localStorage 持久化；交互逻辑必须真实可用（按钮、输入、切换都要有效果）。
+6. 必须完整可用，禁止占位符、TODO、假数据。
+7. 界面文案用中文。
+8. 页面要包含 <title>、<meta name="theme-color">、<meta name="apple-mobile-web-app-capable" content="yes"> 等 PWA 友好标签；不要包含 <link rel="manifest">（工具会自动添加）。
+9. 写完自己检查一遍：逻辑能跑通、样式完整、无语法错误。`;
 
 /* ---------- 迭代修改提示词 ---------- */
 const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户已经有一个小应用（完整 HTML 见下），他会继续提修改要求。
@@ -63,10 +64,11 @@ const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户�
 1. 基于现有 HTML 修改，**保留所有已有功能和数据**（localStorage 的键名不要改）。
 2. 输出**只能**是一个完整的 HTML 文档（以 <!DOCTYPE html> 开头），不要任何解释文字，不要 markdown 围栏。
 3. 所有 CSS 和 JS 必须内联，禁止引用外部文件/CDN 框架。
-4. 移动端优先，UI 精致现代，界面文案中文。
+4. 移动端优先，UI 精致现代，界面文案中文；改动要体现到界面上，不要只说不动。
 5. 必须完整可用，禁止占位符、TODO、假数据。
 6. 如果新要求与旧功能冲突，以新要求为准，但尽量保留有用的旧功能。
-7. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">（工具会自动添加）。`;
+7. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">（工具会自动添加）。
+8. 写完自己检查一遍：新功能真的能用、样式完整、无语法错误。`;
 
 /* ---------- 工具函数 ---------- */
 function sendJson(res, code, obj) {
@@ -426,6 +428,33 @@ const server = http.createServer((req, res) => {
     fs.rmSync(dir, { recursive: true, force: true });
     console.log("[" + new Date().toISOString() + "] 删除 " + id + " · ip=" + clientIp(req));
     return sendJson(res, 200, { ok: true });
+  }
+  // 回退到上一版（需口令）
+  const rbMatch = p.match(/^\/api\/apps\/([a-z0-9]+)\/rollback$/i);
+  if (req.method === "POST" && rbMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const id = rbMatch[1];
+    const dir = path.join(APPS_DIR, id);
+    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(dir)) return sendJson(res, 404, { error: "应用不存在" });
+    const sessionPath = path.join(dir, "session.json");
+    let version = 1;
+    if (fs.existsSync(sessionPath)) {
+      try { version = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 1; } catch {}
+    }
+    if (version <= 1) return sendJson(res, 400, { error: "没有可回退的版本" });
+    const prevPath = path.join(dir, "versions", "v" + (version - 1) + ".html");
+    if (!prevPath.startsWith(dir) || !fs.existsSync(prevPath)) return sendJson(res, 400, { error: "找不到上一版" });
+    // 当前版也存档（回退可逆）
+    fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
+    fs.copyFileSync(prevPath, path.join(dir, "index.html"));
+    const newVersion = version - 1;
+    const title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
+    fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
+    fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString() }));
+    console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
+    return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
   }
   if (req.method === "POST" && p === "/api/generate") {
     let bodyText = "";
