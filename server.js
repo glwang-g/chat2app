@@ -48,31 +48,34 @@ const THINKING = (process.env.THINKING || config.thinking) ? "enabled" : "disabl
 /* ---------- 系统提示词 ---------- */
 const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
 
-硬性要求：
-1. 输出**只能**是一个完整的 HTML 文档（以 <!DOCTYPE html> 开头），不要输出任何解释文字，不要用 markdown 代码围栏。
-2. 所有 CSS 和 JS 必须内联在同一个文件里，禁止引用任何外部文件/CDN/框架，用原生 HTML/CSS/JS。
-3. 移动端优先：适配手机屏幕（viewport），桌面也能用。
-4. **聚焦一个核心功能，做精做透**，不要堆砌功能；界面要现代精致（深色/渐变/圆角/阴影/动效），像正经 App 而不像演示页。
-5. 所有用户数据用 localStorage 持久化；交互逻辑必须真实可用（按钮、输入、切换都要有效果）。
-6. 必须完整可用，禁止占位符、TODO、假数据。
-7. 界面文案用中文。
-8. 页面要包含 <title>、<meta name="theme-color">、<meta name="apple-mobile-web-app-capable" content="yes"> 等 PWA 友好标签；不要包含 <link rel="manifest">（工具会自动添加）。
-9. 写完自己检查一遍：逻辑能跑通、样式完整、无语法错误。
-10. 在 HTML 里加一行注释 `<!--CHANGES: 用一句话中文说明本次做了什么改动/实现了什么功能-->`（放在 <body> 开头即可，这是给用户看的改动说明）。`;
+**输出格式（必须严格遵守）**：
+第一步：先输出【改动说明】——用 2-4 句中文，**针对用户本次需求和上下文，具体说明你做了什么**（全新应用就说：这个应用是什么、有哪些功能、界面长什么样）。要说人话、有具体细节，禁止"已按要求完成"这类模板空话。
+第二步：单独一行输出【完整代码】。
+第三步：用 \`\`\`html 代码块包裹完整的 HTML。
+
+其他硬性要求：
+1. HTML 必须是完整文档（<!DOCTYPE html> 开头），所有 CSS/JS 内联，禁止外部文件/CDN/框架。
+2. 移动端优先，桌面也能用；界面精致现代（深色/渐变/圆角/阴影/动效）。
+3. **聚焦一个核心功能，做精做透**；交互逻辑必须真实可用；数据用 localStorage。
+4. 禁止占位符、TODO、假数据；界面文案中文。
+5. 页面包含 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">。
+6. 写完自己检查一遍：逻辑能跑通、样式完整、无语法错误。`;
 
 /* ---------- 迭代修改提示词 ---------- */
 const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户已经有一个小应用（完整 HTML 见下），他会继续提修改要求。
 
-硬性要求：
-1. 基于现有 HTML 修改，**保留所有已有功能和数据**（localStorage 的键名不要改）。
-2. 输出**只能**是一个完整的 HTML 文档（以 <!DOCTYPE html> 开头），不要任何解释文字，不要 markdown 围栏。
-3. 所有 CSS 和 JS 必须内联，禁止引用外部文件/CDN 框架。
-4. 移动端优先，UI 精致现代，界面文案中文；改动要体现到界面上，不要只说不动。
-5. 必须完整可用，禁止占位符、TODO、假数据。
-6. 如果新要求与旧功能冲突，以新要求为准，但尽量保留有用的旧功能。
-7. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">（工具会自动添加）。
-8. 写完自己检查一遍：新功能真的能用、样式完整、无语法错误。
-9. 在 HTML 里加一行注释 `<!--CHANGES: 用一句话中文说明这次改了什么（相比上一版）-->`（放在 <body> 开头即可）。`;
+**输出格式（必须严格遵守）**：
+第一步：先输出【改动说明】——用 2-4 句中文，**针对用户本次要求，具体说明你改了什么**（如"把时间字体从 32px 调大到 48px，并加了秒数显示；布局从单列改成上下结构"）。要说人话、具体到改动点，禁止"已按要求完成"这类模板空话。
+第二步：单独一行输出【完整代码】。
+第三步：用 \`\`\`html 代码块输出修改后完整的 HTML。
+
+其他硬性要求：
+1. 基于现有 HTML 修改，**保留所有已有功能和数据**（localStorage 键名不要改）。
+2. HTML 必须完整（<!DOCTYPE html> 开头），所有 CSS/JS 内联，禁止外部文件/CDN。
+3. 移动端优先，界面精致现代，文案中文；改动必须真实体现在代码里。
+4. 禁止占位符、TODO、假数据。
+5. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">。
+6. 写完自己检查一遍：新功能真的能用、样式完整、无语法错误。`;
 
 /* ---------- 工具函数 ---------- */
 function sendJson(res, code, obj) {
@@ -322,6 +325,7 @@ async function handleGenerate(req, res, bodyText, ip) {
 
   const reader = upstream.body.getReader();
   let raw = "";
+  let inCode = false;
   const decoder = new TextDecoder();
   let lastFlush = Date.now();
   // 关键：SSE 事件可能被 TCP 拆分到多次 read()，必须跨读取缓冲，
@@ -338,8 +342,20 @@ async function handleGenerate(req, res, bodyText, ip) {
         parseSSE(part, (j) => {
           const delta = j.choices && j.choices[0] && j.choices[0].delta;
           if (delta && delta.content) {
-            raw += delta.content;
-            sse({ type: "token", text: delta.content });
+            const c = delta.content;
+            raw += c;
+            if (!inCode) {
+              const fenceIdx = raw.indexOf("```");
+              if (fenceIdx === -1) {
+                sse({ type: "feedback", text: c });
+              } else {
+                inCode = true;
+                const consumedBefore = raw.length - c.length;
+                const fenceLocal = fenceIdx - consumedBefore;
+                if (fenceLocal > 0) sse({ type: "feedback", text: c.slice(0, fenceLocal) });
+                sse({ type: "status", text: "正在生成代码…" });
+              }
+            }
             lastFlush = Date.now();
           }
         });
@@ -361,7 +377,15 @@ async function handleGenerate(req, res, bodyText, ip) {
     return;
   }
 
-  const html = extractHtml(raw);
+  // 拆分：围栏前是模型真实说明，围栏里是 HTML
+  let feedback = "";
+  let html = raw.trim();
+  const fenceM = raw.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  if (fenceM) {
+    html = fenceM[1].trim();
+    feedback = raw.slice(0, fenceM.index).replace(/【改动说明】|【完整代码】/g, "").trim();
+  }
+  html = extractHtml(html);
   const title = extractTitle(html);
   sse({ type: "step", icon: "✅", text: "已生成应用代码（" + title + "）" });
   sse({ type: "status", text: "正在打包并发布…" });
@@ -397,7 +421,8 @@ async function handleGenerate(req, res, bodyText, ip) {
     type: "done",
     result: {
       id, sessionId: id, title, version: newVersion, isIteration,
-      changes: extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
+      feedback,
+      changes: feedback || extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
       url: BASE_URL + "/apps/" + id + "/",
       files, deploy: result,
     },
