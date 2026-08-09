@@ -245,10 +245,20 @@ function renderApps(apps) {
       <div class="t">${escapeHtml(a.title)} <span class="v">${escapeHtml(verBadge)}</span></div>
       <div class="m">${escapeHtml(a.id)}<br>${escapeHtml(meta)}</div>
       <div class="btns">
+        <button class="pri resume">继续编辑</button>
         <button class="open">打开</button>
         <button class="copy">复制链接</button>
         <button class="del">删除</button>
       </div>`;
+    item.querySelector(".resume").addEventListener("click", () => {
+      $("#appsModal").classList.remove("on");
+      sessionId = null;
+      appVersion = 0;
+      const oldRw = document.getElementById("result");
+      if (oldRw) oldRw.remove();
+      addMsg("bot", "正在恢复「" + a.title + "」的会话…");
+      restoreSession(a.id);
+    });
     item.querySelector(".open").addEventListener("click", () => window.open(a.url, "_blank"));
     item.querySelector(".copy").addEventListener("click", async () => {
       try { await navigator.clipboard.writeText(a.url); toast("链接已复制 ✓"); }
