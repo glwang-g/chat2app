@@ -1,10 +1,11 @@
 {
   "baseUrl": "https://freexlib.com",
-  "model": "deepseek-chat",
+  "model": "deepseek-v4-flash",
   "deepseekUrl": "https://api.deepseek.com/chat/completions",
   "apiToken": "",
   "rateLimitPerHour": 30,
   "deploy": {
     "mode": "local"
-  }
+  },
+  "thinking": false
 }

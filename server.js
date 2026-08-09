@@ -42,6 +42,8 @@ const MODEL = config.model || "deepseek-chat";
 const API_TOKEN = process.env.API_TOKEN || config.apiToken || "";
 const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_HOUR || config.rateLimitPerHour || 0);
 const BASE_URL = (process.env.BASE_URL || config.baseUrl || "https://freexlib.com").replace(/\/+$/, "");
+// DeepSeek V4 思考模式默认开启（又慢又贵）；默认显式关闭，保持旧 deepseek-chat 的非思考行为
+const THINKING = (process.env.THINKING || config.thinking) ? "enabled" : "disabled";
 
 /* ---------- 系统提示词 ---------- */
 const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
@@ -295,7 +297,7 @@ async function handleGenerate(req, res, bodyText, ip) {
     upstream = await fetch(DEEPSEEK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + DEEPSEEK_KEY },
-      body: JSON.stringify({ model: MODEL, messages, stream: true, temperature: 0.7 }),
+      body: JSON.stringify({ model: MODEL, messages, stream: true, temperature: 0.7, thinking: { type: THINKING } }),
     });
   } catch (e) {
     sse({ type: "error", message: "请求 DeepSeek 失败（网络错误）：" + e.message });
