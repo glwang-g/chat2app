@@ -57,7 +57,8 @@ const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述�
 6. 必须完整可用，禁止占位符、TODO、假数据。
 7. 界面文案用中文。
 8. 页面要包含 <title>、<meta name="theme-color">、<meta name="apple-mobile-web-app-capable" content="yes"> 等 PWA 友好标签；不要包含 <link rel="manifest">（工具会自动添加）。
-9. 写完自己检查一遍：逻辑能跑通、样式完整、无语法错误。`;
+9. 写完自己检查一遍：逻辑能跑通、样式完整、无语法错误。
+10. 在 HTML 里加一行注释 `<!--CHANGES: 用一句话中文说明本次做了什么改动/实现了什么功能-->`（放在 <body> 开头即可，这是给用户看的改动说明）。`;
 
 /* ---------- 迭代修改提示词 ---------- */
 const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户已经有一个小应用（完整 HTML 见下），他会继续提修改要求。
@@ -70,7 +71,8 @@ const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户�
 5. 必须完整可用，禁止占位符、TODO、假数据。
 6. 如果新要求与旧功能冲突，以新要求为准，但尽量保留有用的旧功能。
 7. 页面保留 <title>、theme-color、apple-mobile-web-app-capable 等 PWA 标签；不要加 <link rel="manifest">（工具会自动添加）。
-8. 写完自己检查一遍：新功能真的能用、样式完整、无语法错误。`;
+8. 写完自己检查一遍：新功能真的能用、样式完整、无语法错误。
+9. 在 HTML 里加一行注释 `<!--CHANGES: 用一句话中文说明这次改了什么（相比上一版）-->`（放在 <body> 开头即可）。`;
 
 /* ---------- 工具函数 ---------- */
 function sendJson(res, code, obj) {
@@ -143,6 +145,11 @@ function extractTitle(html) {
   // 宽容匹配：模型偶尔会输出 </title> 缺斜杠（如 <title>x</title> 或 <title>xtitle>）
   const m = html.match(/<title[^>]*>([\s\S]*?)(?:<\/?title>|title>)/i);
   return m ? m[1].trim().replace(/\s+/g, " ") : "未命名应用";
+}
+// 提取模型写在 HTML 里的改动说明注释
+function extractChanges(html) {
+  const m = html.match(/<!--\s*CHANGES:([\s\S]*?)-->/i);
+  return m ? m[1].trim().replace(/\s+/g, " ") : "";
 }
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -273,7 +280,8 @@ async function handleGenerate(req, res, bodyText, ip) {
   });
   const sse = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
 
-  sse({ type: "status", text: isIteration ? "正在根据你的要求修改应用…" : "正在创建应用…" });
+  const shortPrompt = prompt.length > 24 ? prompt.slice(0, 24) + "…" : prompt;
+  sse({ type: "status", text: isIteration ? "正在修改：「" + shortPrompt + "」" : "正在创建应用…" });
   // 加载该会话的历史需求，让模型记住之前聊过什么
   let history = [];
   if (isIteration) {
@@ -353,9 +361,10 @@ async function handleGenerate(req, res, bodyText, ip) {
     return;
   }
 
-  sse({ type: "status", text: isIteration ? "正在更新应用…" : "正在打包并发布…" });
   const html = extractHtml(raw);
   const title = extractTitle(html);
+  sse({ type: "step", icon: "✅", text: "已生成应用代码（" + title + "）" });
+  sse({ type: "status", text: "正在打包并发布…" });
   const id = isIteration ? sessionId : genId();
   const appDir = path.join(APPS_DIR, id);
   fs.mkdirSync(appDir, { recursive: true });
@@ -381,11 +390,14 @@ async function handleGenerate(req, res, bodyText, ip) {
   fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory }));
   console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
 
+  sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
   const result = await deploy(id, files);
+  sse({ type: "step", icon: "⬆️", text: "已发布：" + BASE_URL + "/apps/" + id + "/" });
   sse({
     type: "done",
     result: {
       id, sessionId: id, title, version: newVersion, isIteration,
+      changes: extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
       url: BASE_URL + "/apps/" + id + "/",
       files, deploy: result,
     },

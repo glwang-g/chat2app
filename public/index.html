@@ -65,6 +65,13 @@ button.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
 .app-item .btns button.del{border-color:var(--err);color:var(--err)}
 .app-item .btns button.del.confirm{background:var(--err);color:#fff;border-color:var(--err)}
 .app-empty{text-align:center;color:var(--dim);font-size:13px;padding:40px 0;line-height:1.8}
+.detail.change{color:var(--acc);background:rgba(93,136,255,.08);border:1px solid rgba(93,136,255,.25);border-radius:9px;padding:8px 11px;margin-top:10px}
+.guide{background:var(--bg2);border:1px dashed var(--line);border-radius:11px;padding:10px 12px;margin-top:10px}
+.guide .g-title{font-size:12.5px;font-weight:600;color:var(--txt);margin-bottom:6px}
+.guide .g-item{font-size:12px;color:var(--dim);line-height:1.8}
+.steps{display:flex;flex-direction:column;gap:5px;margin:2px 0 4px;padding:9px 12px;background:var(--bg2);border:1px solid var(--line);border-radius:12px;max-width:88%;align-self:flex-start}
+.step{font-size:12.5px;color:var(--dim);line-height:1.6;display:flex;gap:8px}
+.step .si{flex-shrink:0}
 .preview{margin-top:10px}
 .preview .pv-label{font-size:12px;color:var(--dim);margin-bottom:6px}
 .preview iframe{width:100%;height:440px;border:1px solid var(--line);border-radius:12px;background:#fff;display:block}
@@ -195,6 +202,20 @@ function addMsg(kind, text) {
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div;
+}
+function addStep(box, evt) {
+  const d = document.createElement("div");
+  d.className = "step";
+  const ic = document.createElement("span");
+  ic.className = "si";
+  ic.textContent = evt.icon || "•";
+  const tx = document.createElement("span");
+  tx.className = "st";
+  tx.textContent = evt.text || "";
+  d.appendChild(ic);
+  d.appendChild(tx);
+  box.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
 }
 function toast(text) {
   const t = $("#toast");
@@ -342,6 +363,9 @@ async function send() {
   addMsg("user", prompt);
   input.value = "";
   const botMsg = addMsg("bot", "⏳ 正在连接…");
+  const stepsBox = document.createElement("div");
+  stepsBox.className = "steps";
+  botMsg.after(stepsBox);
   let acc = "";
   try {
     const headers = { "Content-Type": "application/json" };
@@ -381,10 +405,23 @@ async function send() {
         } else if (evt.type === "status") {
           botMsg.textContent = "⏳ " + evt.text;
           chat.scrollTop = chat.scrollHeight;
+        } else if (evt.type === "step") {
+          addStep(stepsBox, evt);
         } else if (evt.type === "error") {
           throw new Error(evt.message);
         } else if (evt.type === "done") {
           botMsg.remove();
+          // 保留步骤记录作为交互日志，追加完成标记
+          const fin = document.createElement("div");
+          fin.className = "step";
+          const fi = document.createElement("span");
+          fi.className = "si";
+          fi.textContent = "🎉";
+          const ft = document.createElement("span");
+          ft.textContent = "完成 v" + evt.result.version;
+          fin.appendChild(fi);
+          fin.appendChild(ft);
+          stepsBox.appendChild(fin);
           showResult(evt.result);
         }
       }
@@ -413,7 +450,18 @@ function showResult(r) {
   const head = isUpdate
     ? "✅ 「" + escapeHtml(r.title) + "」已更新到 v" + r.version
     : "🎉 「" + escapeHtml(r.title) + "」初版已生成";
+  const changeLine = r.changes
+    ? '<div class="detail change">📝 本次改动：' + escapeHtml(r.changes) + "</div>"
+    : "";
   const rollbackBtn = r.version > 1 ? '<button id="rollback">↩️ 回退到上一版</button>' : "";
+  const guide = `
+    <div class="guide">
+      <div class="g-title">🕹️ 怎么继续操作</div>
+      <div class="g-item">1️⃣ 直接说想改什么，比如「把字体调大」「加个统计」</div>
+      <div class="g-item">2️⃣ 上方的预览可以直接点按试用，不满意就继续说</div>
+      <div class="g-item">3️⃣ 改坏了点「↩️ 回退到上一版」</div>
+      <div class="g-item">4️⃣ 满意了复制链接，发给别人即可打开</div>
+    </div>`;
   if (!wrap) {
     wrap = document.createElement("div");
     wrap.id = "result";
@@ -422,6 +470,7 @@ function showResult(r) {
   wrap.innerHTML = `
     <div class="result-card">
       <h3>${head}</h3>
+      ${changeLine}
       <div class="preview">
         <div class="pv-top">
           <div class="pv-label">👀 实时预览（可直接操作，随修改实时刷新）</div>
@@ -439,6 +488,7 @@ function showResult(r) {
         ${rollbackBtn}
       </div>
       ${depl}
+      ${guide}
       <div class="detail">💬 继续聊天，我会在<strong>同一个链接</strong>上继续更新这个应用，预览也会跟着变。</div>
       <div class="row"><button id="newApp">🆕 新建应用</button></div>
     </div>`;
