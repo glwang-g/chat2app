@@ -373,7 +373,7 @@ async function send() {
     if (token) headers.Authorization = "Bearer " + token;
     const body = { prompt };
     if (sessionId) body.sessionId = sessionId;
-    const resp = await fetch("/api/generate", { method: "POST", headers, body: JSON.stringify(body) });
+    const resp = await fetch("/api/generations", { method: "POST", headers, body: JSON.stringify(body) });
     if (resp.status === 401) {
       addMsg("bot err", "❌ 访问口令不对，点右上角 ⚙️ 重新填写。");
       botMsg.remove();
@@ -389,7 +389,12 @@ async function send() {
       const e = await resp.json().catch(() => ({}));
       throw new Error(e.error || "HTTP " + resp.status);
     }
-    const reader = resp.body.getReader();
+    const task = await resp.json();
+    localStorage.setItem("chat2app_generation", task.generationId);
+    botMsg.textContent = "⏳ 已进入生成队列…";
+    const eventsResp = await fetch(task.eventsUrl, { headers });
+    if (!eventsResp.ok) throw new Error("任务事件连接失败：HTTP " + eventsResp.status);
+    const reader = eventsResp.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
     for (;;) {
@@ -417,6 +422,7 @@ async function send() {
         } else if (evt.type === "error") {
           throw new Error(evt.message);
         } else if (evt.type === "done") {
+          localStorage.removeItem("chat2app_generation");
           if (!feedbackShown) botMsg.remove(); // 有真实说明就保留这条回复
           // 保留步骤记录作为交互日志，追加完成标记
           const fin = document.createElement("div");

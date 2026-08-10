@@ -3,15 +3,37 @@
 移动端聊天 → DeepSeek 流式生成单文件 PWA → 自动发布到 `https://freexlib.com/apps/<id>/`，
 **任何人拿到链接都能立即打开**，手机/桌面浏览器可"安装为应用"。
 
-零 npm 依赖，Node 18+（自带 fetch）。对标 WorkBuddy 的"聊天生成子应用"能力，
+运行时不需要 npm 依赖，构建阶段使用 TypeScript；Node 18+（自带 fetch）。对标 WorkBuddy 的"聊天生成子应用"能力，
 但用你自己的备案域名 + 云服务器，生成的内容 100% 属于你。
 
 ## 本地跑
 
 ```bash
 cp .env.example .env        # 填 DEEPSEEK_API_KEY、API_TOKEN、BASE_URL
+npm install
+npm run build
 node server.js              # http://127.0.0.1:8787
 ```
+
+开发检查：
+
+```bash
+npm install
+npm run typecheck
+npm test
+```
+
+后端源码已经迁移到 `server.ts`，`server.js` 保留为兼容启动入口；`npm run build` 会生成实际运行的 `dist/server.js`。
+
+生成任务接口：
+
+```text
+POST /api/generations              创建异步生成任务，返回 generationId
+GET  /api/generations/:id          查询任务状态和最终结果
+GET  /api/generations/:id/events   通过 SSE 获取任务进度，可重连并重放历史事件
+```
+
+任务状态目前保存在服务进程内，默认保留 30 分钟；服务重启后任务不会恢复。旧的 `POST /api/generate` 流式接口仍保留，便于兼容旧客户端。
 
 浏览器打开后直接聊天即可。生成的应用在 `apps-data/<id>/`，公开路径 `/apps/<id>/`。
 
@@ -34,7 +56,8 @@ docker compose up -d --build
 ```bash
 # 服务器上
 apt install -y nodejs       # 需要 Node 18+（建议用 nodesource 装 20/22 LTS）
-mkdir -p /opt/chat2app && cp -r server.js public config.json /opt/chat2app/
+mkdir -p /opt/chat2app && cp -r server.js server.ts src public config.json package.json package-lock.json tsconfig.json /opt/chat2app/
+cd /opt/chat2app && npm ci && npm run build
 cp .env.example /opt/chat2app/.env   # 填好
 cp chat2app.service /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now chat2app
@@ -69,7 +92,8 @@ systemctl reload nginx
 ## 结构
 
 ```
-server.js            云端后端：DeepSeek 流式代理 + PWA 打包 + 发布 + 限流 + 口令
+server.ts            云端后端源码：DeepSeek 流式代理 + PWA 打包 + 发布 + 限流 + 口令
+server.js            兼容启动入口，实际运行 dist/server.js
 public/              手机聊天界面（PWA：manifest + sw + icon）
 apps-data/<id>/      生成的应用（index.html / manifest.json / sw.js / icon.svg）
 Dockerfile / docker-compose.yml / chat2app.service / nginx.conf.example
