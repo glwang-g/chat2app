@@ -56,11 +56,11 @@ jobs:
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
-      - name: Pull and rebuild on server
+      - name: Pull, build and restart systemd service
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
-            "cd '$DEPLOY_PATH' && git fetch origin master && git checkout master && git pull --ff-only origin master && docker compose up -d --build --remove-orphans"
+            "cd '$DEPLOY_PATH' && git fetch origin master && git checkout master && git pull --ff-only origin master && npm ci && npm run build && sudo systemctl restart chat2app.service"

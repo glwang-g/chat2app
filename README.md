@@ -120,7 +120,7 @@ Dockerfile / docker-compose.yml / chat2app.service / nginx.conf.example
 
 ## GitHub Actions 自动部署
 
-推送到 `master` 后，`.github/workflows/deploy.yml` 会先执行类型检查和测试；全部通过后通过 SSH 登录 Linux 服务器，执行 `git pull --ff-only` 和 `docker compose up -d --build`。
+推送到 `master` 后，`.github/workflows/deploy.yml` 会先执行类型检查和测试；全部通过后通过 SSH 登录 Linux 服务器，执行 `git pull --ff-only`、`npm ci`、`npm run build`，最后重启 `chat2app.service`。当前服务器采用 systemd 部署，因此不依赖 Docker 运行服务。
 
 需要在 GitHub 仓库的 `production` Environment 中配置以下 Secrets：
 
