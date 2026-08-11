@@ -9,6 +9,9 @@
     "typecheck": "tsc --noEmit",
     "start": "npm run build && node server.js"
   },
+  "dependencies": {
+    "playwright-core": "^1.52.0"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"

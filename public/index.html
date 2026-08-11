@@ -155,6 +155,8 @@ let sessionId = null, appVersion = 0, authRequired = false;
   } catch (e) { addMsg("bot err", "无法连接服务，请刷新重试。"); }
   const saved = localStorage.getItem("chat2app_session");
   if (saved) restoreSession(saved);
+  const pending = localStorage.getItem("chat2app_generation");
+  if (pending) resumeGeneration(pending);
 })();
 
 /* ---------- 全屏预览（事件委托，兼容动态生成的展开按钮） ---------- */
@@ -355,6 +357,87 @@ function setInputPlaceholder() {
     : "描述你想要的小应用…（回车发送，Shift+回车换行）";
 }
 
+async function watchGeneration(task, botMsg, stepsBox) {
+  const headers = {};
+  if (token) headers.Authorization = "Bearer " + token;
+  const eventsResp = await fetch(task.eventsUrl || "/api/generations/" + task.generationId + "/events", { headers });
+  if (!eventsResp.ok) throw new Error("任务事件连接失败：HTTP " + eventsResp.status);
+  const reader = eventsResp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "", acc = "", feedbackShown = false;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n");
+    buf = parts.pop();
+    for (const part of parts) {
+      if (!part.startsWith("data: ")) continue;
+      const evt = JSON.parse(part.slice(6));
+      if (evt.type === "ping") continue;
+      if (evt.type === "feedback") {
+        feedbackShown = true;
+        acc += evt.text;
+        botMsg.textContent = acc.replace(/【改动说明】|【完整代码】/g, "");
+      } else if (evt.type === "status") {
+        if (!feedbackShown) botMsg.textContent = "⏳ " + evt.text;
+      } else if (evt.type === "step") {
+        addStep(stepsBox, evt);
+      } else if (evt.type === "error") {
+        if (evt.retryable) {
+          botMsg.textContent = "⏳ 本次生成失败，正在自动重试…";
+          continue;
+        }
+        throw new Error(evt.message || "生成失败");
+      } else if (evt.type === "cancelled") {
+        throw new Error(evt.message || "任务已取消");
+      } else if (evt.type === "done") {
+        localStorage.removeItem("chat2app_generation");
+        if (!feedbackShown) botMsg.remove();
+        const fin = document.createElement("div");
+        fin.className = "step";
+        fin.innerHTML = '<span class="si">🎉</span><span class="st">完成 v' + evt.result.version + "</span>";
+        stepsBox.appendChild(fin);
+        showResult(evt.result);
+      }
+      chat.scrollTop = chat.scrollHeight;
+    }
+  }
+  if (!document.getElementById("result") && !acc) throw new Error("任务流意外结束，请重试");
+}
+
+async function resumeGeneration(id) {
+  try {
+    const headers = {};
+    if (token) headers.Authorization = "Bearer " + token;
+    const resp = await fetch("/api/generations/" + id, { headers });
+    if (!resp.ok) { localStorage.removeItem("chat2app_generation"); return; }
+    const task = await resp.json();
+    if (task.status === "completed" && task.result) {
+      localStorage.removeItem("chat2app_generation");
+      showResult(task.result);
+      return;
+    }
+    if (["failed", "cancelled", "interrupted"].includes(task.status)) {
+      localStorage.removeItem("chat2app_generation");
+      addMsg("bot err", "上次生成任务未完成（" + task.status + "），可以重新发送需求。");
+      return;
+    }
+    busy = true;
+    sendBtn.disabled = true;
+    const botMsg = addMsg("bot", "⏳ 正在恢复未完成的生成任务…");
+    const stepsBox = document.createElement("div");
+    stepsBox.className = "steps";
+    botMsg.after(stepsBox);
+    await watchGeneration({ generationId: id, eventsUrl: "/api/generations/" + id + "/events" }, botMsg, stepsBox);
+  } catch (e) {
+    addMsg("bot err", "恢复生成任务失败：" + e.message);
+  } finally {
+    busy = false;
+    sendBtn.disabled = false;
+  }
+}
+
 async function send() {
   const prompt = input.value.trim();
   if (!prompt || busy) return;
@@ -392,54 +475,7 @@ async function send() {
     const task = await resp.json();
     localStorage.setItem("chat2app_generation", task.generationId);
     botMsg.textContent = "⏳ 已进入生成队列…";
-    const eventsResp = await fetch(task.eventsUrl, { headers });
-    if (!eventsResp.ok) throw new Error("任务事件连接失败：HTTP " + eventsResp.status);
-    const reader = eventsResp.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const parts = buf.split("\n\n");
-      buf = parts.pop();
-      for (const part of parts) {
-        if (!part.startsWith("data: ")) continue;
-        const evt = JSON.parse(part.slice(6));
-        if (evt.type === "feedback") {
-          // 模型的真实说明：流式显示为对话回复（去掉格式标记）
-          feedbackShown = true;
-          acc += evt.text;
-          botMsg.textContent = acc.replace(/【改动说明】|【完整代码】/g, "");
-          chat.scrollTop = chat.scrollHeight;
-        } else if (evt.type === "token") {
-          acc += evt.text; // 代码：只累计，不显示
-        } else if (evt.type === "status") {
-          if (!feedbackShown) botMsg.textContent = "⏳ " + evt.text;
-          chat.scrollTop = chat.scrollHeight;
-        } else if (evt.type === "step") {
-          addStep(stepsBox, evt);
-        } else if (evt.type === "error") {
-          throw new Error(evt.message);
-        } else if (evt.type === "done") {
-          localStorage.removeItem("chat2app_generation");
-          if (!feedbackShown) botMsg.remove(); // 有真实说明就保留这条回复
-          // 保留步骤记录作为交互日志，追加完成标记
-          const fin = document.createElement("div");
-          fin.className = "step";
-          const fi = document.createElement("span");
-          fi.className = "si";
-          fi.textContent = "🎉";
-          const ft = document.createElement("span");
-          ft.textContent = "完成 v" + evt.result.version;
-          fin.appendChild(fi);
-          fin.appendChild(ft);
-          stepsBox.appendChild(fin);
-          showResult(evt.result);
-        }
-      }
-    }
-    if (!acc && !document.getElementById("result")) throw new Error("流意外结束，请重试");
+    await watchGeneration(task, botMsg, stepsBox);
   } catch (e) {
     botMsg.classList.remove("streaming");
     botMsg.textContent = acc || "";

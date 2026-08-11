@@ -1,4 +1,5 @@
 node_modules/
 apps-data/
+tasks-data/
 .env
 dist/

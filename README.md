@@ -33,7 +33,26 @@ GET  /api/generations/:id          查询任务状态和最终结果
 GET  /api/generations/:id/events   通过 SSE 获取任务进度，可重连并重放历史事件
 ```
 
-任务状态目前保存在服务进程内，默认保留 30 分钟；服务重启后任务不会恢复。旧的 `POST /api/generate` 流式接口仍保留，便于兼容旧客户端。
+任务状态目前保存在本地任务文件中，默认保留 30 分钟；服务重启后正在执行的任务会标记为中断，可通过重试接口重新执行。旧的 `POST /api/generate` 流式接口仍保留，便于兼容旧客户端。
+
+当前异步任务层已支持本地任务文件持久化、有限并发、自动重试、取消和刷新恢复。任务文件默认保存在 `tasks-data/`，也可以通过 `TASKS_DIR` 指定目录；`GENERATION_CONCURRENCY` 控制并发数（默认 2），`GENERATION_MAX_RETRIES` 控制自动重试次数（默认 2）。
+
+生成质量和 Patch：
+
+```text
+POST /api/apps/:id/patch          对应用文件执行安全 SEARCH/REPLACE
+```
+
+Patch 要求每个 SEARCH 片段恰好匹配一次，路径不能越权，修改后会重新检查 `index.html` 的 HTML 和 JavaScript 语法。
+
+Linux 浏览器验证是可选能力。安装 Chromium 后设置：
+
+```bash
+BROWSER_VALIDATION=true
+BROWSER_EXECUTABLE=/usr/bin/chromium
+```
+
+验证器使用 `playwright-core` 以无头模式加载应用、捕获 `pageerror`/console error 并截图。没有配置浏览器时会安全跳过，不影响原有 Node-only 部署。
 
 浏览器打开后直接聊天即可。生成的应用在 `apps-data/<id>/`，公开路径 `/apps/<id>/`。
 
@@ -97,6 +116,28 @@ server.js            兼容启动入口，实际运行 dist/server.js
 public/              手机聊天界面（PWA：manifest + sw + icon）
 apps-data/<id>/      生成的应用（index.html / manifest.json / sw.js / icon.svg）
 Dockerfile / docker-compose.yml / chat2app.service / nginx.conf.example
+```
+
+## GitHub Actions 自动部署
+
+推送到 `master` 后，`.github/workflows/deploy.yml` 会先执行类型检查和测试；全部通过后通过 SSH 登录 Linux 服务器，执行 `git pull --ff-only` 和 `docker compose up -d --build`。
+
+需要在 GitHub 仓库的 `production` Environment 中配置以下 Secrets：
+
+```text
+DEPLOY_HOST          服务器地址
+DEPLOY_USER          SSH 用户
+DEPLOY_PATH          服务器上的项目目录，例如 /opt/chat2app
+DEPLOY_SSH_KEY       部署专用 SSH 私钥
+DEPLOY_KNOWN_HOSTS   ssh-keyscan 服务器得到的整行主机指纹
+```
+
+服务器需要提前完成一次初始化：克隆仓库到 `DEPLOY_PATH`、准备 `.env`，并确保部署用户可以执行 Docker。之后本地只需：
+
+```bash
+git add -A
+git commit -m "描述改动"
+git push origin master
 ```
 
 ## 安全说明

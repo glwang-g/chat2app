@@ -12,6 +12,8 @@ const path = require("node:path");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const execFileP = promisify(execFile);
+const { bundleFromHtml, applySearchReplace, assertSafeBundlePath } = require("./src/app-bundle");
+const { validateInBrowser } = require("./src/browser-validator");
 
 /** @typedef {import("./src/contracts").AppManifest} AppManifest */
 /** @typedef {import("./src/contracts").AppSession} AppSession */
@@ -23,6 +25,7 @@ const execFileP = promisify(execFile);
 const ROOT = path.basename(__dirname) === "dist" ? path.resolve(__dirname, "..") : __dirname;
 const PUBLIC = path.join(ROOT, "public");
 const APPS_DIR = path.resolve(ROOT, process.env.APPS_DIR || "apps-data");
+const TASKS_DIR = path.resolve(ROOT, process.env.TASKS_DIR || "tasks-data");
 const PORT = Number(process.env.PORT || 8787);
 
 /* ---------- 配置 ---------- */
@@ -51,6 +54,8 @@ const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_HOUR || config.rateLimitPer
 const BASE_URL = (process.env.BASE_URL || config.baseUrl || "https://freexlib.com").replace(/\/+$/, "");
 // DeepSeek V4 思考模式默认开启（又慢又贵）；默认显式关闭，保持旧 deepseek-chat 的非思考行为
 const THINKING = (process.env.THINKING || config.thinking) ? "enabled" : "disabled";
+const BROWSER_VALIDATION = process.env.BROWSER_VALIDATION === "true" || config.browserValidation === true;
+const BROWSER_EXECUTABLE = process.env.BROWSER_EXECUTABLE || config.browserExecutable || "";
 
 /* ---------- 系统提示词 ---------- */
 const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
@@ -125,9 +130,43 @@ function checkAuth(req) {
 }
 const rateMap = new Map();
 const generationJobs = new Map();
+const generationQueue = [];
+let activeGenerations = 0;
 const GENERATION_TTL = 30 * 60 * 1000;
+const GENERATION_CONCURRENCY = Math.max(1, Number(process.env.GENERATION_CONCURRENCY || config.generationConcurrency || 2));
+const GENERATION_MAX_RETRIES = Math.max(0, Number(process.env.GENERATION_MAX_RETRIES || config.generationMaxRetries || 2));
+
+function taskFile(id) { return path.join(TASKS_DIR, id + ".json"); }
+function persistGenerationJob(job) {
+  fs.mkdirSync(TASKS_DIR, { recursive: true });
+  const saved = { ...job, listeners: undefined, controller: undefined };
+  const tmp = taskFile(job.id) + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(saved));
+  fs.renameSync(tmp, taskFile(job.id));
+}
+
+function loadGenerationJobs() {
+  if (!fs.existsSync(TASKS_DIR)) return;
+  for (const name of fs.readdirSync(TASKS_DIR)) {
+    if (!/^([a-z0-9]+)\.json$/i.test(name)) continue;
+    try {
+      const job = JSON.parse(fs.readFileSync(path.join(TASKS_DIR, name), "utf8"));
+      job.listeners = new Set();
+      if (job.status === "running" || job.status === "queued") {
+        job.status = "interrupted";
+        job.error = "服务在任务执行期间重启，请点击重试。";
+        job.updatedAt = new Date().toISOString();
+      }
+      generationJobs.set(job.id, job);
+      persistGenerationJob(job);
+    } catch (error) {
+      if (process.env.DEBUG) console.error("[debug] 无法读取任务：", name, error);
+    }
+  }
+}
 
 function emitGeneration(job, event) {
+  if (job.status === "cancelled") return;
   job.events.push(event);
   job.updatedAt = new Date().toISOString();
   if (event.type === "done") {
@@ -137,14 +176,16 @@ function emitGeneration(job, event) {
     job.status = "failed";
     job.error = event.message || "生成失败";
   }
+  persistGenerationJob(job);
   for (const listener of job.listeners || []) listener(event);
 }
 
-function createGenerationJob() {
+function createGenerationJob(bodyText, ip) {
   const id = genId();
   const now = new Date().toISOString();
-  const job = { id, status: "queued", createdAt: now, updatedAt: now, events: [], result: null, error: null, listeners: new Set() };
+  const job = { id, status: "queued", createdAt: now, updatedAt: now, events: [], result: null, error: null, attempts: 0, requestBody: bodyText, ip, listeners: new Set() };
   generationJobs.set(id, job);
+  persistGenerationJob(job);
   setTimeout(() => {
     const current = generationJobs.get(id);
     if (current && Date.now() - Date.parse(current.updatedAt) > GENERATION_TTL) generationJobs.delete(id);
@@ -152,9 +193,38 @@ function createGenerationJob() {
   return job;
 }
 
-async function runGenerationJob(job, req, bodyText, ip) {
-  job.status = "running";
+function enqueueGenerationJob(job, req) {
+  generationQueue.push({ job, req });
+  job.status = "queued";
   job.updatedAt = new Date().toISOString();
+  persistGenerationJob(job);
+  pumpGenerationQueue();
+}
+
+function pumpGenerationQueue() {
+  while (activeGenerations < GENERATION_CONCURRENCY && generationQueue.length) {
+    const item = generationQueue.shift();
+    if (item.job.status === "cancelled") continue;
+    activeGenerations++;
+    void runGenerationJob(item.job, item.req).finally(() => {
+      activeGenerations--;
+      pumpGenerationQueue();
+    });
+  }
+}
+
+async function runGenerationJob(job, req) {
+  const bodyText = job.requestBody;
+  const ip = job.ip || "?";
+  for (let attempt = job.attempts + 1; attempt <= GENERATION_MAX_RETRIES + 1; attempt++) {
+    if (job.status === "cancelled") return;
+    job.status = "running";
+    job.attempts = attempt;
+    job.error = null;
+    job.updatedAt = new Date().toISOString();
+    persistGenerationJob(job);
+    if (attempt > 1) emitGeneration(job, { type: "status", text: `正在进行第 ${attempt} 次重试…` });
+    job.controller = new AbortController();
   const sink = {
     statusCode: 200,
     writeHead(code) { this.statusCode = code; },
@@ -163,7 +233,11 @@ async function runGenerationJob(job, req, bodyText, ip) {
       for (const part of text.split("\n\n")) {
         const line = part.split("\n").find((item) => item.startsWith("data:"));
         if (!line) continue;
-        try { emitGeneration(job, JSON.parse(line.slice(5).trim())); } catch {}
+        try {
+          const event = JSON.parse(line.slice(5).trim());
+          if (event.type === "error") event.retryable = job.attempts <= GENERATION_MAX_RETRIES;
+          emitGeneration(job, event);
+        } catch {}
       }
     },
     end(body) {
@@ -173,11 +247,32 @@ async function runGenerationJob(job, req, bodyText, ip) {
     },
   };
   try {
-    await handleGenerate(req, sink, bodyText, ip, true);
+    await handleGenerate(req, sink, bodyText, ip, true, job.controller.signal);
     if (job.status === "running") emitGeneration(job, { type: "error", message: "生成任务意外结束" });
   } catch (error) {
-    emitGeneration(job, { type: "error", message: error instanceof Error ? error.message : String(error) });
+    if (job.status !== "cancelled") emitGeneration(job, { type: "error", message: error instanceof Error ? error.message : String(error), retryable: attempt <= GENERATION_MAX_RETRIES });
   }
+    job.controller = undefined;
+    if (job.status === "completed" || job.status === "cancelled") return;
+    if (attempt <= GENERATION_MAX_RETRIES) {
+      emitGeneration(job, { type: "status", text: "本次生成失败，准备自动重试…" });
+      continue;
+    }
+    return;
+  }
+}
+
+function cancelGenerationJob(job) {
+  if (["completed", "failed", "cancelled"].includes(job.status)) return false;
+  job.status = "cancelled";
+  job.error = "任务已取消";
+  job.updatedAt = new Date().toISOString();
+  if (job.controller) job.controller.abort();
+  const event = { type: "cancelled", message: job.error };
+  job.events.push(event);
+  persistGenerationJob(job);
+  for (const listener of job.listeners || []) listener(event);
+  return true;
 }
 
 function generationSummary(job) {
@@ -233,6 +328,18 @@ function extractTitle(html) {
 function extractChanges(html) {
   const m = html.match(/<!--\s*CHANGES:([\s\S]*?)-->/i);
   return m ? m[1].trim().replace(/\s+/g, " ") : "";
+}
+function validateGeneratedHtml(html) {
+  if (!/^<!DOCTYPE html>/i.test(html.trim())) return "生成结果缺少 <!DOCTYPE html>";
+  if (!/<html[\s>]/i.test(html) || !/<\/html>/i.test(html)) return "生成结果不是完整 HTML 文档";
+  if (!/<title[^>]*>[\s\S]*?<\/?title>|<title[^>]*>[\s\S]*?title>/i.test(html)) return "生成结果缺少 title";
+  const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)];
+  try {
+    for (const script of scripts) new Function(script[1]);
+  } catch (error) {
+    return "JavaScript 语法检查失败：" + (error instanceof Error ? error.message : String(error));
+  }
+  return null;
 }
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -329,7 +436,7 @@ function listApps() {
 }
 
 /* ---------- 生成主流程 ---------- */
-async function handleGenerate(req, res, bodyText, ip, skipAccess = false) {
+async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal = undefined) {
   let body;
   try { body = JSON.parse(bodyText); } catch { return sendJson(res, 400, { error: "请求体不是合法 JSON" }); }
   const prompt = (body.prompt || "").trim();
@@ -392,6 +499,7 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false) {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer " + DEEPSEEK_KEY },
       body: JSON.stringify({ model: MODEL, messages, stream: true, temperature: 0.7, thinking: { type: THINKING } }),
+      signal,
     });
   } catch (e) {
     sse({ type: "error", message: "请求 DeepSeek 失败（网络错误）：" + e.message });
@@ -469,7 +577,14 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false) {
     feedback = raw.slice(0, fenceM.index).replace(/【改动说明】|【完整代码】/g, "").trim();
   }
   html = extractHtml(html);
+  const validationError = validateGeneratedHtml(html);
+  if (validationError) {
+    sse({ type: "error", message: validationError });
+    res.end();
+    return;
+  }
   const title = extractTitle(html);
+  const bundle = bundleFromHtml(html);
   sse({ type: "step", icon: "✅", text: "已生成应用代码（" + title + "）" });
   sse({ type: "status", text: "正在打包并发布…" });
   const id = isIteration ? sessionId : genId();
@@ -489,7 +604,7 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false) {
     fs.copyFileSync(path.join(appDir, "index.html"), path.join(vDir, "v" + curVersion + ".html"));
   }
   const files = ["index.html", "manifest.json", "sw.js", "icon.svg"];
-  fs.writeFileSync(path.join(appDir, "index.html"), html);
+  fs.writeFileSync(path.join(appDir, "index.html"), bundle.files["index.html"]);
   fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
   fs.writeFileSync(path.join(appDir, "sw.js"), SW_JS);
   fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
@@ -498,6 +613,17 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false) {
   console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
 
   sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
+  if (BROWSER_VALIDATION) {
+    sse({ type: "status", text: "正在用无头浏览器验证…" });
+    const validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
+    if (!validation.ok) {
+      sse({ type: "error", message: "浏览器验证失败：" + validation.errors.join("；") });
+      res.end();
+      return;
+    }
+    if (validation.skipped) sse({ type: "step", icon: "ℹ️", text: "未配置浏览器，跳过无头验证" });
+    else sse({ type: "step", icon: "🧪", text: "浏览器验证通过" });
+  }
   const result = await deploy(id, files);
   sse({ type: "step", icon: "⬆️", text: "已发布：" + BASE_URL + "/apps/" + id + "/" });
   sse({
@@ -555,7 +681,7 @@ const server = http.createServer((req, res) => {
       if (job.status === "completed" || job.status === "failed") return res.end();
       const listener = (event) => {
         res.write("data: " + JSON.stringify(event) + "\n\n");
-        if (event.type === "done" || event.type === "error") {
+        if (event.type === "done" || event.type === "cancelled" || (event.type === "error" && !event.retryable)) {
           clearInterval(heartbeat);
           job.listeners.delete(listener);
           res.end();
@@ -567,6 +693,29 @@ const server = http.createServer((req, res) => {
       return;
     }
     return sendJson(res, 200, generationSummary(job));
+  }
+  const cancelMatch = p.match(/^\/api\/generations\/([a-z0-9]+)\/cancel$/i);
+  if (req.method === "POST" && cancelMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const job = generationJobs.get(cancelMatch[1]);
+    if (!job) return sendJson(res, 404, { error: "生成任务不存在或已过期" });
+    if (!cancelGenerationJob(job)) return sendJson(res, 409, { error: "任务当前不可取消", status: job.status });
+    return sendJson(res, 200, generationSummary(job));
+  }
+  const retryMatch = p.match(/^\/api\/generations\/([a-z0-9]+)\/retry$/i);
+  if (req.method === "POST" && retryMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const job = generationJobs.get(retryMatch[1]);
+    if (!job) return sendJson(res, 404, { error: "生成任务不存在或已过期" });
+    if (!["failed", "interrupted", "cancelled"].includes(job.status)) return sendJson(res, 409, { error: "任务当前不可重试", status: job.status });
+    job.status = "queued";
+    job.error = null;
+    job.updatedAt = new Date().toISOString();
+    persistGenerationJob(job);
+    enqueueGenerationJob(job, { headers: { authorization: API_TOKEN ? "Bearer " + API_TOKEN : "" } });
+    return sendJson(res, 202, generationSummary(job));
   }
   if (req.method === "POST" && p === "/api/generations") {
     let bodyText = "";
@@ -580,8 +729,8 @@ const server = http.createServer((req, res) => {
       if (authErr) return sendJson(res, 401, { error: authErr });
       const rateErr = checkRate(clientIp(req));
       if (rateErr) return sendJson(res, 429, { error: rateErr });
-      const job = createGenerationJob();
-      void runGenerationJob(job, req, bodyText, clientIp(req));
+      const job = createGenerationJob(bodyText, clientIp(req));
+      enqueueGenerationJob(job, req);
       return sendJson(res, 202, { generationId: job.id, status: job.status, eventsUrl: "/api/generations/" + job.id + "/events", statusUrl: "/api/generations/" + job.id });
     });
     return;
@@ -591,6 +740,53 @@ const server = http.createServer((req, res) => {
     const authErr = checkAuth(req);
     if (authErr) return sendJson(res, 401, { error: authErr });
     return sendJson(res, 200, { apps: listApps() });
+  }
+  const patchMatch = p.match(/^\/api\/apps\/([a-z0-9]+)\/patch$/i);
+  if (req.method === "POST" && patchMatch) {
+    const authErr = checkAuth(req);
+    if (authErr) return sendJson(res, 401, { error: authErr });
+    const id = patchMatch[1];
+    const dir = path.join(APPS_DIR, id);
+    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
+    let bodyText = "";
+    req.on("data", (chunk) => { bodyText += chunk; if (bodyText.length > 2e6) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const body = JSON.parse(bodyText);
+        if (!Array.isArray(body.patches) || !body.patches.length) return sendJson(res, 400, { error: "patches 不能为空" });
+        const files = {};
+        for (const patch of body.patches) {
+          const safePath = assertSafeBundlePath(patch.path);
+          const filePath = path.join(dir, safePath);
+          if (!filePath.startsWith(dir) || !fs.existsSync(filePath)) throw new Error("文件不存在：" + safePath);
+          files[safePath] = fs.readFileSync(filePath, "utf8");
+        }
+        const patched = applySearchReplace({ entry: "index.html", files }, body.patches);
+        if (!patched.files["index.html"]) throw new Error("Patch 必须包含 index.html");
+        const validationError = validateGeneratedHtml(patched.files["index.html"]);
+        if (validationError) throw new Error(validationError);
+        const sessionPath = path.join(dir, "session.json");
+        let version = 1;
+        let history = [];
+        if (fs.existsSync(sessionPath)) {
+          try {
+            const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+            version = session.version || 1;
+            history = Array.isArray(session.history) ? session.history : [];
+          } catch {}
+        }
+        fs.mkdirSync(path.join(dir, "versions"), { recursive: true });
+        fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
+        for (const [filePath, content] of Object.entries(patched.files)) fs.writeFileSync(path.join(dir, filePath), content);
+        const newVersion = version + 1;
+        const title = extractTitle(patched.files["index.html"]);
+        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + body.patches.map((item) => item.path).join(", ")].slice(-20) }));
+        return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    });
+    return;
   }
   // 应用详情（需口令，含历史，用于恢复会话）
   const delMatch = p.match(/^\/api\/apps\/([a-z0-9]+)$/i);
@@ -685,6 +881,7 @@ const server = http.createServer((req, res) => {
 // process entry check must also recognize the stable server.js launcher.
 if (require.main === module || path.basename(process.argv[1] || "") === "server.js") {
   fs.mkdirSync(APPS_DIR, { recursive: true });
+  loadGenerationJobs();
   server.listen(PORT, "0.0.0.0", () => {
     console.log("Chat2App（云端版）已启动：http://0.0.0.0:" + PORT);
     console.log("公开域名：" + BASE_URL);
@@ -695,4 +892,4 @@ if (require.main === module || path.basename(process.argv[1] || "") === "server.
   });
 }
 
-module.exports = { extractHtml, extractTitle, genId, genManifest, genIcon, deploy, parseSSE, SW_JS };
+module.exports = { extractHtml, extractTitle, validateGeneratedHtml, genId, genManifest, genIcon, deploy, parseSSE, SW_JS };

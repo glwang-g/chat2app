@@ -62,7 +62,7 @@ export interface GenerateResult {
   deploy: DeployResult;
 }
 
-export type GenerationStatus = "queued" | "running" | "completed" | "failed";
+export type GenerationStatus = "queued" | "running" | "completed" | "failed" | "interrupted" | "cancelled";
 
 export interface GenerationJob {
   id: string;

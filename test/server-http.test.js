@@ -12,6 +12,8 @@ let port;
 let upstreamPort;
 let upstream;
 let appsDir;
+let tasksDir;
+let generatedAppId;
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -41,18 +43,20 @@ test.before(async () => {
   upstreamPort = await freePort();
   upstream = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const html = "<!DOCTYPE html><html><head><title>测试应用</title></head><body><script>" + "const value = 1;".repeat(30) + "</script></body></html>";
+    const html = "<!DOCTYPE html><html><head><title>测试应用</title></head><body><script>" + "const value = 1;\n" + "console.log(value);\n".repeat(30) + "</script></body></html>";
     const content = "测试生成完成。\n```html\n" + html + "\n```";
-    res.end("data: " + JSON.stringify({ choices: [{ delta: { content } }] }) + "\n\ndata: [DONE]\n\n");
+    setTimeout(() => res.end("data: " + JSON.stringify({ choices: [{ delta: { content } }] }) + "\n\ndata: [DONE]\n\n"), 120);
   });
   await new Promise((resolve) => upstream.listen(upstreamPort, "127.0.0.1", resolve));
   appsDir = fs.mkdtempSync(path.join("/tmp", "chat2app-test-"));
+  tasksDir = fs.mkdtempSync(path.join("/tmp", "chat2app-tasks-"));
   child = spawn(process.execPath, [path.join(ROOT, "server.js")], {
     cwd: ROOT,
     env: {
       ...process.env,
       PORT: String(port),
       APPS_DIR: appsDir,
+      TASKS_DIR: tasksDir,
       BASE_URL: `http://127.0.0.1:${port}`,
       API_TOKEN: "test-token",
       RATE_LIMIT_PER_HOUR: "30",
@@ -68,6 +72,7 @@ test.after(() => {
   if (child && !child.killed) child.kill("SIGTERM");
   if (upstream) upstream.close();
   if (appsDir) fs.rmSync(appsDir, { recursive: true, force: true });
+  if (tasksDir) fs.rmSync(tasksDir, { recursive: true, force: true });
 });
 
 test("health endpoint reports a running service", async () => {
@@ -137,8 +142,39 @@ test("generation API creates a task and replays its completed SSE events", async
   const status = await statusResponse.json();
   assert.equal(status.status, "completed");
   assert.equal(status.result.title, "测试应用");
+  generatedAppId = status.result.id;
 
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${status.result.id}/`);
   assert.equal(appResponse.status, 200);
   assert.match(await appResponse.text(), /测试应用/);
+});
+
+test("apps patch API updates one file and increments the app version", async () => {
+  const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+  const response = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}/patch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ patches: [{ path: "index.html", search: "测试应用", replace: "测试应用二版" }] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.version, 2);
+  const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);
+  assert.match(await appResponse.text(), /测试应用二版/);
+});
+
+test("generation API can cancel a running task", async () => {
+  const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+  const createResponse = await fetch(`http://127.0.0.1:${port}/api/generations`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ prompt: "创建一个稍后取消的应用" }),
+  });
+  assert.equal(createResponse.status, 202);
+  const task = await createResponse.json();
+  const cancelResponse = await fetch(`http://127.0.0.1:${port}/api/generations/${task.generationId}/cancel`, { method: "POST", headers });
+  assert.equal(cancelResponse.status, 200);
+  const status = await cancelResponse.json();
+  assert.equal(status.status, "cancelled");
+  assert.equal(status.error, "任务已取消");
 });

@@ -1,7 +1,7 @@
 # Chat2App · 云端版
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json package-lock.json tsconfig.json server.ts ./
+COPY package.json package-lock.json tsconfig.json server.js server.ts ./
 COPY src ./src
 COPY public ./public
 COPY config.json ./

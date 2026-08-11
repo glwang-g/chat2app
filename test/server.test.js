@@ -4,11 +4,13 @@ const assert = require("node:assert/strict");
 const {
   extractHtml,
   extractTitle,
+  validateGeneratedHtml,
   genId,
   genManifest,
   genIcon,
   parseSSE,
 } = require("../server.js");
+const { bundleFromHtml, applySearchReplace, assertSafeBundlePath } = require("../dist/src/app-bundle.js");
 
 test("extractHtml removes an html code fence", () => {
   const html = extractHtml("说明\n```html\n<!DOCTYPE html><html><body>你好</body></html>\n```");
@@ -24,6 +26,20 @@ test("extractTitle handles normal and malformed closing title tags", () => {
   assert.equal(extractTitle("<title>  记账 · 小应用 </title>"), "记账 · 小应用");
   assert.equal(extractTitle("<title>计时器title>"), "计时器");
   assert.equal(extractTitle("<html></html>"), "未命名应用");
+});
+
+test("validateGeneratedHtml rejects incomplete documents and invalid scripts", () => {
+  assert.equal(validateGeneratedHtml("<html><title>x</title></html>"), "生成结果缺少 <!DOCTYPE html>");
+  assert.match(validateGeneratedHtml("<!DOCTYPE html><html><title>x</title><script>if (</script></html>"), /JavaScript 语法检查失败/);
+  assert.equal(validateGeneratedHtml("<!DOCTYPE html><html><head><title>x</title></head><body><script>const ok = true;</script></body></html>"), null);
+});
+
+test("AppBundle applies one unique SEARCH/REPLACE patch and rejects unsafe paths", () => {
+  const bundle = bundleFromHtml("<!DOCTYPE html><html><head><title>旧标题</title></head><body>旧内容</body></html>");
+  const updated = applySearchReplace(bundle, [{ path: "index.html", search: "旧标题", replace: "新标题" }]);
+  assert.match(updated.files["index.html"], /新标题/);
+  assert.throws(() => assertSafeBundlePath("../secret"), /不安全/);
+  assert.throws(() => applySearchReplace(bundle, [{ path: "index.html", search: "不存在", replace: "x" }]), /当前 0 次/);
 });
 
 test("genId creates a safe non-empty id", () => {
