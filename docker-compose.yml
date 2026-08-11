@@ -7,9 +7,14 @@ services:
     ports:
       - "8787:8787"
     environment:
-      DEEPSEEK_API_KEY: "sk-xxx"          # 改成你的
-      API_TOKEN: "change-me"              # 访问口令（生成应用需要）
-      RATE_LIMIT_PER_HOUR: "30"
-      BASE_URL: "https://freexlib.com"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+      API_TOKEN: "${API_TOKEN}"
+      RATE_LIMIT_PER_HOUR: "${RATE_LIMIT_PER_HOUR:-30}"
+      BASE_URL: "${BASE_URL}"
+      BROWSER_VALIDATION: "${BROWSER_VALIDATION:-false}"
+      BROWSER_EXECUTABLE: "${BROWSER_EXECUTABLE:-}"
+      GENERATION_CONCURRENCY: "${GENERATION_CONCURRENCY:-2}"
+      GENERATION_MAX_RETRIES: "${GENERATION_MAX_RETRIES:-2}"
     volumes:
       - ./apps-data:/app/apps-data
+      - ./tasks-data:/app/tasks-data
