@@ -1,0 +1,132 @@
+# Chat2App 项目进展与演进路线
+
+更新时间：2026-08-12
+
+## 一、总体方向
+
+Chat2App 不照搬 Aider 的复杂度，而是借鉴其核心思想，保持纯 JavaScript/TypeScript、单文件 PWA 和轻量部署模式。
+
+当前目标链路：
+
+```text
+需求
+  ↓
+轻量规划
+  ↓
+增量编辑
+  ↓
+浏览器验证
+  ↓
+错误反馈自动修复
+  ↓
+版本化发布
+```
+
+## 二、已完成能力
+
+### 1. TypeScript 与任务系统
+
+- `server.ts` 作为主源码，`server.js` 保留兼容入口。
+- TypeScript 构建、类型检查和 HTTP 测试已建立。
+- 异步生成任务、任务持久化、队列、并发限制、自动重试和取消已完成。
+- 任务支持 SSE 事件重放，页面刷新后可以恢复未完成任务。
+
+### 2. 完整聊天历史
+
+应用的 `session.json` 现在同时保存：
+
+- 用户每次需求；
+- DeepSeek 的完整文字反馈；
+- 生成过程中的状态和结果；
+- 最终应用版本信息。
+
+模板化流程已压缩为一条摘要：
+
+```text
+✅ 已完成：代码生成、PWA 打包、验证并发布
+```
+
+历史恢复时仍会显示完整的用户需求和模型反馈，不再只保留用户输入。
+
+### 3. 规划与增量编辑
+
+- 新应用请求会要求模型先输出轻量实现计划。
+- 迭代请求优先要求模型输出 `SEARCH/REPLACE` Patch。
+- Patch 可以精确修改现有 HTML，减少无关内容变动。
+- Patch 格式不合法、匹配不唯一或模型返回完整 HTML 时，自动回退到完整 HTML 流程，保持兼容性。
+
+### 4. 浏览器验证与自动修复
+
+- 已集成可选的 Playwright Chromium 无头验证。
+- 验证页面 HTTP 状态、`pageerror` 和浏览器 console error。
+- 验证失败后，会把错误反馈给 DeepSeek，请求生成修复后的 HTML。
+- 修复后再次验证；仍失败才终止发布并向用户报告。
+
+服务器当前已配置：
+
+```env
+BROWSER_VALIDATION=true
+BROWSER_EXECUTABLE=/usr/bin/google-chrome
+```
+
+### 5. 版本化发布
+
+- 每次迭代前备份旧版 HTML 到 `versions/`。
+- 应用版本号递增。
+- 支持回退到上一版。
+- 仍保持单 HTML PWA 的产品形态，不改变最终用户访问方式。
+
+## 三、部署链路
+
+当前采用 GitHub Actions + systemd：
+
+```text
+本地修改
+  ↓ git commit / git push
+GitHub
+  ↓ Actions：npm ci、构建、测试
+腾讯云服务器
+  ↓ git pull、npm ci、npm run build
+systemd 重启 chat2app.service
+```
+
+服务器信息：
+
+- 项目目录：`/opt/chat2app`
+- 服务端口：`8790`
+- 域名：`https://app.freexlib.com`
+- 进程管理：`chat2app.service`
+- 数据目录：`apps-data/`、`tasks-data/`
+- 当前代码版本：`b4341e2`
+
+服务器 `.env` 只保留在服务器，不进入 Git，也不会被自动部署覆盖。
+
+## 四、测试状态
+
+当前本地测试结果：
+
+```text
+17 tests passed
+0 failed
+```
+
+已覆盖健康检查、配置、鉴权、生成任务、SSE 重放、Patch、取消任务、HTML 校验、PWA 资源和基础工具函数。
+
+## 五、当前边界
+
+- 规划是轻量提示阶段，不是独立的多 Agent 规划器。
+- Patch 是优先策略，不强制要求模型每次都返回 Patch。
+- 自动修复目前最多进行一轮修复和再次验证。
+- 浏览器验证会增加生成耗时；只有验证失败时才会额外调用一次 LLM。
+- 当前仍以单 HTML PWA 为最终产物，暂不引入复杂多文件工程。
+
+## 六、建议的下一步
+
+先做一次线上端到端验收，而不是继续扩展架构：
+
+1. 新建一个简单计数器应用。
+2. 连续迭代两次，验证 Patch 和历史记录。
+3. 检查 Chrome 浏览器验证、自动修复、版本号和回退。
+4. 查看 `journalctl -u chat2app.service`，确认没有异常重启。
+
+验收通过后，再根据真实失败样本决定是否增强 Patch 解析、验证规则或自动修复次数。
