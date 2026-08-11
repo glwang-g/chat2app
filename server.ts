@@ -180,6 +180,32 @@ function emitGeneration(job, event) {
   for (const listener of job.listeners || []) listener(event);
 }
 
+function readSession(dir) {
+  const sessionPath = path.join(dir, "session.json");
+  if (!fs.existsSync(sessionPath)) return {};
+  try {
+    const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    return session && typeof session === "object" ? session : {};
+  } catch { return {}; }
+}
+
+function conversationFromEvents(events, prompt) {
+  const entries = [{ role: "user", content: prompt, kind: "message", icon: undefined, createdAt: new Date().toISOString() }];
+  let feedback = "";
+  const flushFeedback = () => {
+    if (!feedback.trim()) return;
+    entries.push({ role: "assistant", content: feedback.replace(/【改动说明】|【完整代码】/g, "").trim(), kind: "feedback", icon: undefined, createdAt: new Date().toISOString() });
+    feedback = "";
+  };
+  for (const event of events) {
+    if (event.type === "feedback") feedback += event.text || "";
+    else if (event.type === "status" && event.text) { flushFeedback(); entries.push({ role: "assistant", content: event.text, kind: "status", icon: undefined, createdAt: new Date().toISOString() }); }
+    else if (event.type === "step" && event.text) { flushFeedback(); entries.push({ role: "assistant", content: event.text, kind: "step", icon: event.icon || "•", createdAt: new Date().toISOString() }); }
+  }
+  flushFeedback();
+  return entries;
+}
+
 function createGenerationJob(bodyText, ip) {
   const id = genId();
   const now = new Date().toISOString();
@@ -471,7 +497,8 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
     "X-Accel-Buffering": "no",
     Connection: "keep-alive",
   });
-  const sse = (obj) => res.write("data: " + JSON.stringify(obj) + "\n\n");
+  const timeline = [];
+  const sse = (obj) => { timeline.push(obj); res.write("data: " + JSON.stringify(obj) + "\n\n"); };
 
   const shortPrompt = prompt.length > 24 ? prompt.slice(0, 24) + "…" : prompt;
   sse({ type: "status", text: isIteration ? "正在修改：「" + shortPrompt + "」" : "正在创建应用…" });
@@ -609,7 +636,7 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   fs.writeFileSync(path.join(appDir, "sw.js"), SW_JS);
   fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
   const savedHistory = isIteration ? [...history, prompt].slice(-20) : [prompt];
-  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory }));
+  // 会话文件在全部发布步骤完成后写入，确保恢复时能看到完整过程。
   console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
 
   sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
@@ -634,8 +661,12 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
       changes: feedback || extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
       url: BASE_URL + "/apps/" + id + "/",
       files, deploy: result,
-    },
+      },
   });
+  const previousSession = readSession(appDir);
+  const previousConversation = Array.isArray(previousSession.conversation) ? previousSession.conversation : [];
+  const conversation = [...previousConversation, ...conversationFromEvents(timeline, prompt)].slice(-120);
+  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation }));
   res.end();
 }
 
@@ -768,11 +799,13 @@ const server = http.createServer((req, res) => {
         const sessionPath = path.join(dir, "session.json");
         let version = 1;
         let history = [];
+        let conversation = [];
         if (fs.existsSync(sessionPath)) {
           try {
             const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
             version = session.version || 1;
             history = Array.isArray(session.history) ? session.history : [];
+            conversation = Array.isArray(session.conversation) ? session.conversation : [];
           } catch {}
         }
         fs.mkdirSync(path.join(dir, "versions"), { recursive: true });
@@ -780,7 +813,7 @@ const server = http.createServer((req, res) => {
         for (const [filePath, content] of Object.entries(patched.files)) fs.writeFileSync(path.join(dir, filePath), content);
         const newVersion = version + 1;
         const title = extractTitle(patched.files["index.html"]);
-        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + body.patches.map((item) => item.path).join(", ")].slice(-20) }));
+        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + body.patches.map((item) => item.path).join(", ")].slice(-20), conversation }));
         return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -796,7 +829,7 @@ const server = http.createServer((req, res) => {
     const id = delMatch[1];
     const dir = path.join(APPS_DIR, id);
     if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
-    let title = "未命名应用", version = 1, updatedAt = null, history = [];
+    let title = "未命名应用", version = 1, updatedAt = null, history = [], conversation = [];
     const sp = path.join(dir, "session.json");
     if (fs.existsSync(sp)) {
       try {
@@ -805,12 +838,13 @@ const server = http.createServer((req, res) => {
         if (typeof sj.version === "number") version = sj.version;
         if (sj.updatedAt) updatedAt = sj.updatedAt;
         if (Array.isArray(sj.history)) history = sj.history;
+        if (Array.isArray(sj.conversation)) conversation = sj.conversation;
       } catch {}
     }
     if (!title || title === "未命名应用") {
       try { title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8")); } catch {}
     }
-    return sendJson(res, 200, { app: { id, title, version, versions: 0, updatedAt, history, url: BASE_URL + "/apps/" + id + "/" } });
+    return sendJson(res, 200, { app: { id, title, version, versions: 0, updatedAt, history, conversation, url: BASE_URL + "/apps/" + id + "/" } });
   }
   // 删除应用（需口令）
   if (req.method === "DELETE" && delMatch) {
@@ -846,7 +880,8 @@ const server = http.createServer((req, res) => {
     const title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8"));
     fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
     fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
-    fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString() }));
+    const session = readSession(dir);
+    fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString() }));
     console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
     return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
   }

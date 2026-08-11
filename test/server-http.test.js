@@ -144,6 +144,14 @@ test("generation API creates a task and replays its completed SSE events", async
   assert.equal(status.result.title, "测试应用");
   generatedAppId = status.result.id;
 
+  const sessionResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}`, { headers });
+  assert.equal(sessionResponse.status, 200);
+  const sessionBody = await sessionResponse.json();
+  assert.ok(Array.isArray(sessionBody.app.conversation));
+  assert.ok(sessionBody.app.conversation.some((entry) => entry.role === "user" && entry.content === "创建一个测试应用"));
+  assert.ok(sessionBody.app.conversation.some((entry) => entry.kind === "feedback" && entry.content.includes("测试生成完成")));
+  assert.ok(sessionBody.app.conversation.some((entry) => entry.kind === "step" && entry.content.includes("已生成应用代码")));
+
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${status.result.id}/`);
   assert.equal(appResponse.status, 200);
   assert.match(await appResponse.text(), /测试应用/);

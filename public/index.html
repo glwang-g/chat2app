@@ -187,7 +187,9 @@ async function restoreSession(id) {
     const { app } = await resp.json();
     sessionId = app.id;
     appVersion = app.version;
-    if (Array.isArray(app.history) && app.history.length) {
+    if (Array.isArray(app.conversation) && app.conversation.length) {
+      restoreConversation(app.conversation);
+    } else if (Array.isArray(app.history) && app.history.length) {
       for (const h of app.history) addMsg("user", h);
     }
     addMsg("bot", "↩️ 已恢复上次的会话：**" + app.title + "** v" + app.version + "，继续描述修改要求即可，预览会接着更新。");
@@ -195,6 +197,20 @@ async function restoreSession(id) {
   } catch (e) {
     addMsg("bot err", "恢复会话失败：" + e.message);
   }
+}
+
+function restoreConversation(entries) {
+  for (const entry of entries) {
+    if (!entry || !entry.content) continue;
+    if (entry.role === "user") addMsg("user", entry.content);
+    else if (entry.kind === "step" || entry.kind === "status") {
+      const box = document.createElement("div");
+      box.className = "steps history-steps";
+      addStep(box, { icon: entry.icon || (entry.kind === "status" ? "⏳" : "•"), text: entry.content });
+      chat.appendChild(box);
+    } else addMsg("bot", entry.content);
+  }
+  chat.scrollTop = chat.scrollHeight;
 }
 
 function addMsg(kind, text) {
