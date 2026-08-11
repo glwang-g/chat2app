@@ -235,6 +235,17 @@ function addStep(box, evt) {
   box.appendChild(d);
   chat.scrollTop = chat.scrollHeight;
 }
+function updateProcessSummary(box, text) {
+  let line = box.querySelector(".process-summary");
+  if (!line) {
+    line = document.createElement("div");
+    line.className = "step process-summary";
+    line.innerHTML = '<span class="si">⏳</span><span class="st"></span>';
+    box.appendChild(line);
+  }
+  line.querySelector(".st").textContent = text;
+  chat.scrollTop = chat.scrollHeight;
+}
 function toast(text) {
   const t = $("#toast");
   t.textContent = text;
@@ -397,8 +408,9 @@ async function watchGeneration(task, botMsg, stepsBox) {
         botMsg.textContent = acc.replace(/【改动说明】|【完整代码】/g, "");
       } else if (evt.type === "status") {
         if (!feedbackShown) botMsg.textContent = "⏳ " + evt.text;
+        updateProcessSummary(stepsBox, "正在处理：" + evt.text);
       } else if (evt.type === "step") {
-        addStep(stepsBox, evt);
+        updateProcessSummary(stepsBox, "进行中：" + evt.text);
       } else if (evt.type === "error") {
         if (evt.retryable) {
           botMsg.textContent = "⏳ 本次生成失败，正在自动重试…";
@@ -409,6 +421,7 @@ async function watchGeneration(task, botMsg, stepsBox) {
         throw new Error(evt.message || "任务已取消");
       } else if (evt.type === "done") {
         localStorage.removeItem("chat2app_generation");
+        updateProcessSummary(stepsBox, "✅ 已完成：代码生成、PWA 打包、验证并发布");
         if (!feedbackShown) botMsg.remove();
         const fin = document.createElement("div");
         fin.className = "step";

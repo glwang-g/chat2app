@@ -192,6 +192,7 @@ function readSession(dir) {
 function conversationFromEvents(events, prompt) {
   const entries = [{ role: "user", content: prompt, kind: "message", icon: undefined, createdAt: new Date().toISOString() }];
   let feedback = "";
+  let hasProcess = false;
   const flushFeedback = () => {
     if (!feedback.trim()) return;
     entries.push({ role: "assistant", content: feedback.replace(/【改动说明】|【完整代码】/g, "").trim(), kind: "feedback", icon: undefined, createdAt: new Date().toISOString() });
@@ -199,10 +200,10 @@ function conversationFromEvents(events, prompt) {
   };
   for (const event of events) {
     if (event.type === "feedback") feedback += event.text || "";
-    else if (event.type === "status" && event.text) { flushFeedback(); entries.push({ role: "assistant", content: event.text, kind: "status", icon: undefined, createdAt: new Date().toISOString() }); }
-    else if (event.type === "step" && event.text) { flushFeedback(); entries.push({ role: "assistant", content: event.text, kind: "step", icon: event.icon || "•", createdAt: new Date().toISOString() }); }
+    else if ((event.type === "status" || event.type === "step") && event.text) { flushFeedback(); hasProcess = true; }
   }
   flushFeedback();
+  if (hasProcess) entries.push({ role: "assistant", content: "✅ 已完成：代码生成、PWA 打包、验证并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() });
   return entries;
 }
 
