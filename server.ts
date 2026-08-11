@@ -61,9 +61,10 @@ const BROWSER_EXECUTABLE = process.env.BROWSER_EXECUTABLE || config.browserExecu
 const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
 
 **输出格式（必须严格遵守）**：
-第一步：先输出【改动说明】——用 2-4 句中文，**针对用户本次需求和上下文，具体说明你做了什么**（全新应用就说：这个应用是什么、有哪些功能、界面长什么样）。要说人话、有具体细节，禁止"已按要求完成"这类模板空话。
-第二步：单独一行输出【完整代码】。
-第三步：用 \`\`\`html 代码块包裹完整的 HTML。
+第一步：先输出【实现计划】——用 2-4 条短句说明准备实现的核心功能和验证重点。
+第二步：输出【改动说明】——用 2-4 句中文说明实际完成了什么。
+第三步：单独一行输出【完整代码】。
+第四步：用 \`\`\`html 代码块包裹完整的 HTML。
 
 其他硬性要求：
 1. HTML 必须是完整文档（<!DOCTYPE html> 开头），所有 CSS/JS 内联，禁止外部文件/CDN/框架。
@@ -77,9 +78,14 @@ const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述�
 const ITERATE_SYSTEM_PROMPT = `你是一个"极客小应用修改器"。用户已经有一个小应用（完整 HTML 见下），他会继续提修改要求。
 
 **输出格式（必须严格遵守）**：
-第一步：先输出【改动说明】——用 2-4 句中文，**针对用户本次要求，具体说明你改了什么**（如"把时间字体从 32px 调大到 48px，并加了秒数显示；布局从单列改成上下结构"）。要说人话、具体到改动点，禁止"已按要求完成"这类模板空话。
-第二步：单独一行输出【完整代码】。
-第三步：用 \`\`\`html 代码块输出修改后完整的 HTML。
+第一步：先输出【实现计划】——用 2-4 条短句说明修改范围、保留的功能和验证重点。
+第二步：优先输出 SEARCH/REPLACE 增量补丁，格式为：
+【增量补丁】
+\`\`\`json
+[{"path":"index.html","search":"唯一的旧代码","replace":"修改后的代码"}]
+\`\`\`
+只有无法安全用补丁表达时，才输出【完整代码】及完整 HTML。
+最后输出【改动说明】——用 2-4 句中文说明实际改动。
 
 其他硬性要求：
 1. 基于现有 HTML 修改，**保留所有已有功能和数据**（localStorage 键名不要改）。
@@ -120,6 +126,48 @@ function parseSSE(text, onData) {
       onData(j);
     } catch { /* 忽略不完整块 */ }
   }
+}
+
+function parseGeneratedOutput(raw, baseHtml = null) {
+  const patchBlock = raw.match(/【增量补丁】\s*```(?:json)?\s*([\s\S]*?)```/i);
+  if (baseHtml && patchBlock) {
+    try {
+      const patches = JSON.parse(patchBlock[1]);
+      if (Array.isArray(patches) && patches.length) {
+        const patched = applySearchReplace(bundleFromHtml(baseHtml), patches);
+        const html = patched.files["index.html"];
+        return { html, feedback: raw.replace(patchBlock[0], "").replace(/【实现计划】|【改动说明】/g, "").trim(), mode: "patch" };
+      }
+    } catch {}
+  }
+  let html = raw.trim();
+  let feedback = "";
+  const fenceM = raw.match(/```(?:html)?\s*([\s\S]*?)```/i);
+  if (fenceM) {
+    html = fenceM[1].trim();
+    feedback = raw.slice(0, fenceM.index).replace(/【实现计划】|【改动说明】|【完整代码】/g, "").trim();
+  }
+  return { html: extractHtml(html), feedback, mode: "full" };
+}
+
+async function requestRepairHtml(html, errors, signal) {
+  const repairPrompt = `请修复下面这个单文件 HTML 应用的运行问题，只返回修复后的完整 HTML 代码块，不要解释。
+浏览器验证错误：${errors.join("；")}
+原始 HTML：
+\`\`\`html
+${html}
+\`\`\``;
+  const upstream = await fetch(DEEPSEEK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + DEEPSEEK_KEY },
+    body: JSON.stringify({ model: MODEL, messages: [{ role: "system", content: ITERATE_SYSTEM_PROMPT }, { role: "user", content: repairPrompt }], stream: false, temperature: 0.2 }),
+    signal,
+  });
+  if (!upstream.ok) throw new Error("修复请求失败：DeepSeek HTTP " + upstream.status);
+  const body = await upstream.json();
+  const content = body.choices?.[0]?.message?.content || "";
+  const parsed = parseGeneratedOutput(content);
+  return parsed.html;
 }
 
 /* ---------- 访问控制 ---------- */
@@ -589,30 +637,26 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
     res.end();
     return;
   }
-  if (raw.length < 200) {
+  const hasPatchPayload = isIteration && /【增量补丁】/.test(raw);
+  if (raw.length < 200 && !hasPatchPayload) {
     if (process.env.DEBUG) console.error("[debug] raw.length =", raw.length);
     sse({ type: "error", message: "生成内容过短，可能被模型拒绝或网络异常，请重试。" });
     res.end();
     return;
   }
 
-  // 拆分：围栏前是模型真实说明，围栏里是 HTML
-  let feedback = "";
-  let html = raw.trim();
-  const fenceM = raw.match(/```(?:html)?\s*([\s\S]*?)```/i);
-  if (fenceM) {
-    html = fenceM[1].trim();
-    feedback = raw.slice(0, fenceM.index).replace(/【改动说明】|【完整代码】/g, "").trim();
-  }
-  html = extractHtml(html);
-  const validationError = validateGeneratedHtml(html);
+  // 优先应用迭代 Patch；模型不遵守 Patch 格式时兼容完整 HTML。
+  let parsedOutput = parseGeneratedOutput(raw, isIteration ? existingHtml : null);
+  let feedback = parsedOutput.feedback;
+  let html = parsedOutput.html;
+  let validationError = validateGeneratedHtml(html);
   if (validationError) {
     sse({ type: "error", message: validationError });
     res.end();
     return;
   }
-  const title = extractTitle(html);
-  const bundle = bundleFromHtml(html);
+  let title = extractTitle(html);
+  let bundle = bundleFromHtml(html);
   sse({ type: "step", icon: "✅", text: "已生成应用代码（" + title + "）" });
   sse({ type: "status", text: "正在打包并发布…" });
   const id = isIteration ? sessionId : genId();
@@ -643,11 +687,31 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
   if (BROWSER_VALIDATION) {
     sse({ type: "status", text: "正在用无头浏览器验证…" });
-    const validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
+    let validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
     if (!validation.ok) {
-      sse({ type: "error", message: "浏览器验证失败：" + validation.errors.join("；") });
-      res.end();
-      return;
+      sse({ type: "status", text: "验证发现问题，正在自动修复…" });
+      try {
+        const repairedHtml = await requestRepairHtml(html, validation.errors, signal);
+        const repairError = validateGeneratedHtml(repairedHtml);
+        if (repairError) throw new Error(repairError);
+        html = repairedHtml;
+        title = extractTitle(html);
+        bundle = bundleFromHtml(html);
+        fs.writeFileSync(path.join(appDir, "index.html"), bundle.files["index.html"]);
+        fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
+        fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
+        sse({ type: "step", icon: "🔧", text: "已根据浏览器错误自动修复" });
+        validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
+      } catch (repairError) {
+        sse({ type: "error", message: "浏览器验证失败，自动修复也未通过：" + (repairError instanceof Error ? repairError.message : String(repairError)) });
+        res.end();
+        return;
+      }
+      if (!validation.ok) {
+        sse({ type: "error", message: "自动修复后浏览器验证仍失败：" + validation.errors.join("；") });
+        res.end();
+        return;
+      }
     }
     if (validation.skipped) sse({ type: "step", icon: "ℹ️", text: "未配置浏览器，跳过无头验证" });
     else sse({ type: "step", icon: "🧪", text: "浏览器验证通过" });
