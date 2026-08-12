@@ -1,6 +1,6 @@
 # Chat2App · 云端版
 
-当前演进状态、Aider 对比和部署记录见：[项目进展与演进路线](docs/PROJECT_STATUS.md)。
+当前演进状态、Aider / Bolt.diy 借鉴、生产验收和后续计划见：[项目进展与演进路线](docs/PROJECT_STATUS.md)。
 
 移动端聊天 → DeepSeek 流式生成单文件 PWA → 自动发布到 `https://freexlib.com/apps/<id>/`，
 **任何人拿到链接都能立即打开**，手机/桌面浏览器可"安装为应用"。
