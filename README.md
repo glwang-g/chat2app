@@ -56,6 +56,22 @@ BROWSER_EXECUTABLE=/usr/bin/chromium
 
 验证器使用 `playwright-core` 以无头模式加载应用、捕获 `pageerror`/console error 并截图。没有配置浏览器时会安全跳过，不影响原有 Node-only 部署。
 
+也可以在 `config.json` 中配置生成应用后的交互验收步骤：
+
+```json
+{
+  "browserInteractions": [
+    { "name": "点击保存", "selector": "#save", "action": "click", "expectSelector": ".saved" },
+    { "name": "输入内容", "selector": "#input", "action": "fill", "value": "测试内容" },
+    { "name": "提交表单", "selector": "#form", "action": "press", "value": "Enter" }
+  ]
+}
+```
+
+支持 `click`、`fill`、`press` 三种操作；`expectSelector` 用于确认交互后的元素出现。验收失败会进入现有的浏览器错误自动修复流程。
+
+这意味着你可以把一条真实用户路径写成自动化验收，例如“输入内容 -> 点击保存 -> 刷新后确认 localStorage 还在”，或者“计数器加一 -> 重新进入页面确认状态恢复”。
+
 浏览器打开后直接聊天即可。生成的应用在 `apps-data/<id>/`，公开路径 `/apps/<id>/`。
 
 ## 部署到你的轻量云服务器

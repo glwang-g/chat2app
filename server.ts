@@ -9,11 +9,13 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const execFileP = promisify(execFile);
-const { bundleFromHtml, applySearchReplace, assertSafeBundlePath } = require("./src/app-bundle");
+const { bundleFromHtml, applySearchReplace, assertSafeBundlePath, summarizeBundleChanges } = require("./src/app-bundle");
 const { validateInBrowser } = require("./src/browser-validator");
+const { streamChat, completeChat } = require("./src/model-adapter");
 
 /** @typedef {import("./src/contracts").AppManifest} AppManifest */
 /** @typedef {import("./src/contracts").AppSession} AppSession */
@@ -56,6 +58,8 @@ const BASE_URL = (process.env.BASE_URL || config.baseUrl || "https://freexlib.co
 const THINKING = (process.env.THINKING || config.thinking) ? "enabled" : "disabled";
 const BROWSER_VALIDATION = process.env.BROWSER_VALIDATION === "true" || config.browserValidation === true;
 const BROWSER_EXECUTABLE = process.env.BROWSER_EXECUTABLE || config.browserExecutable || "";
+const BROWSER_INTERACTIONS = Array.isArray(config.browserInteractions) ? config.browserInteractions : [];
+const MODEL_OPTIONS = { url: DEEPSEEK_URL, apiKey: DEEPSEEK_KEY, model: MODEL };
 
 /* ---------- 系统提示词 ---------- */
 const SYSTEM_PROMPT = `你是一个"极客小应用生成器"。用户会描述一个小应用需求，你要生成一个**完整、可直接运行、精致得像正经 App 的单个 HTML 文件**。
@@ -150,22 +154,83 @@ function parseGeneratedOutput(raw, baseHtml = null) {
   return { html: extractHtml(html), feedback, mode: "full" };
 }
 
-async function requestRepairHtml(html, errors, signal) {
-  const repairPrompt = `请修复下面这个单文件 HTML 应用的运行问题，只返回修复后的完整 HTML 代码块，不要解释。
+const COMPLEXITY_KEYWORDS = /修复|报错|错误|异常|白屏|没反应|无响应|丢数据|数据丢失|崩溃|不工作|登录|同步|统计图|图表|异步|接口|请求|持久化|localStorage|跨模块|重构/i;
+
+function assessRequestComplexity(prompt: string, options: {
+  browserErrors?: string[];
+  history?: string[];
+  htmlLength?: number;
+  patchFailures?: number;
+  patchCount?: number;
+} = {}) {
+  const errors = Array.isArray(options.browserErrors) ? options.browserErrors : [];
+  const history = Array.isArray(options.history) ? options.history : [];
+  const htmlLength = Number(options.htmlLength || 0);
+  const patchFailures = Number(options.patchFailures || 0);
+  const patchCount = Number(options.patchCount || 0);
+  let score = 0;
+  const reasons = [];
+  if (COMPLEXITY_KEYWORDS.test(prompt)) { score++; reasons.push("需求包含修复或复杂功能信号"); }
+  if (errors.length) { score++; reasons.push("存在浏览器错误"); }
+  if (patchFailures > 0) { score++; reasons.push("Patch 曾失败"); }
+  if (patchCount > 2) { score++; reasons.push("一次修改涉及多个位置"); }
+  if (/并|同时|以及|另外/.test(prompt)) { score++; reasons.push("需求同时涉及多个修改点"); }
+  if (htmlLength > 18000) { score++; reasons.push("当前 HTML 较大"); }
+  if (history.length > 3) { score++; reasons.push("需要较多历史上下文"); }
+  const level = score >= 4 ? "complex" : score >= 2 ? "medium" : "simple";
+  return { level, score, reasons };
+}
+
+function compactHistory(history, limit = 3) {
+  return history.slice(-limit).map((item, index) => `${index + 1}. ${item}`).join("\n");
+}
+
+function extractRelevantHtml(html, prompt, errors = [], maxChars = 14000) {
+  if (!html || html.length <= maxChars) return html;
+  const terms = [...String(prompt).matchAll(/[A-Za-z_$][\w$-]{2,}|[\u4e00-\u9fff]{2,8}/g)].map((m) => m[0]);
+  for (const error of errors) terms.push(...String(error).match(/[A-Za-z_$][\w$]*/g) || []);
+  const uniqueTerms = [...new Set(terms)].filter((term) => term.length >= 2).slice(0, 24);
+  const chunks = [];
+  for (const term of uniqueTerms) {
+    let index = html.indexOf(term);
+    if (index < 0) continue;
+    const start = Math.max(0, index - Math.floor(maxChars / 2));
+    const end = Math.min(html.length, start + maxChars);
+    chunks.push(html.slice(start, end));
+  }
+  const selected = [...new Set(chunks)].join("\n\n<!-- 相关代码片段 -->\n\n");
+  return selected ? selected.slice(0, maxChars) : html.slice(0, maxChars);
+}
+
+function buildIterationUserContext(prompt, html, history, complexity) {
+  const historyText = complexity.level === "simple" ? "无" : compactHistory(history);
+  const htmlText = complexity.level === "complex"
+    ? extractRelevantHtml(html, prompt, [], 14000)
+    : html;
+  const scope = complexity.level === "complex"
+    ? "这是复杂修改。以下是与需求相关的代码片段；请优先返回精确的 SEARCH/REPLACE Patch，无法安全定位时再返回完整 HTML。"
+    : "请优先返回精确的 SEARCH/REPLACE Patch；每个 SEARCH 必须在对应文件中恰好匹配一次。";
+  return `${scope}\n\n历史需求：\n${historyText}\n\n当前应用代码：\n\`\`\`html\n${htmlText}\n\`\`\`\n\n用户的修改要求：\n${prompt}`;
+}
+
+function buildRepairPrompt(html, errors, prompt = "", history = []) {
+  const complexity = assessRequestComplexity(prompt || "修复浏览器错误", { browserErrors: errors, htmlLength: html.length, history });
+  const relevant = complexity.level === "complex" ? extractRelevantHtml(html, prompt, errors) : html;
+  const contextNote = complexity.level === "complex"
+    ? "问题较复杂，下面先给出相关代码片段；请结合错误定位并返回修复后的完整 HTML。"
+    : "请基于完整 HTML 修复问题。";
+  return { complexity, prompt: `请修复下面这个单文件 HTML 应用的运行问题，只返回修复后的完整 HTML 代码块，不要解释。
+${contextNote}
 浏览器验证错误：${errors.join("；")}
 原始 HTML：
 \`\`\`html
-${html}
-\`\`\``;
-  const upstream = await fetch(DEEPSEEK_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: "Bearer " + DEEPSEEK_KEY },
-    body: JSON.stringify({ model: MODEL, messages: [{ role: "system", content: ITERATE_SYSTEM_PROMPT }, { role: "user", content: repairPrompt }], stream: false, temperature: 0.2 }),
-    signal,
-  });
-  if (!upstream.ok) throw new Error("修复请求失败：DeepSeek HTTP " + upstream.status);
-  const body = await upstream.json();
-  const content = body.choices?.[0]?.message?.content || "";
+${relevant}
+\`\`\`` };
+}
+
+async function requestRepairHtml(html, errors, signal, prompt = "", history = []) {
+  const repairContext = buildRepairPrompt(html, errors, prompt, history);
+  const content = await completeChat(MODEL_OPTIONS, [{ role: "system", content: ITERATE_SYSTEM_PROMPT }, { role: "user", content: repairContext.prompt }], signal, 0.2);
   const parsed = parseGeneratedOutput(content);
   return parsed.html;
 }
@@ -223,6 +288,7 @@ function emitGeneration(job, event) {
   } else if (event.type === "error") {
     job.status = "failed";
     job.error = event.message || "生成失败";
+    job.failure = { message: job.error, events: job.events.slice(-40), attempt: job.attempts, updatedAt: job.updatedAt };
   }
   persistGenerationJob(job);
   for (const listener of job.listeners || []) listener(event);
@@ -258,7 +324,7 @@ function conversationFromEvents(events, prompt) {
 function createGenerationJob(bodyText, ip) {
   const id = genId();
   const now = new Date().toISOString();
-  const job = { id, status: "queued", createdAt: now, updatedAt: now, events: [], result: null, error: null, attempts: 0, requestBody: bodyText, ip, listeners: new Set() };
+  const job = { id, status: "queued", createdAt: now, updatedAt: now, events: [], result: null, error: null, failure: null, attempts: 0, requestBody: bodyText, ip, listeners: new Set() };
   generationJobs.set(id, job);
   persistGenerationJob(job);
   setTimeout(() => {
@@ -296,6 +362,7 @@ async function runGenerationJob(job, req) {
     job.status = "running";
     job.attempts = attempt;
     job.error = null;
+    job.failure = null;
     job.updatedAt = new Date().toISOString();
     persistGenerationJob(job);
     if (attempt > 1) emitGeneration(job, { type: "status", text: `正在进行第 ${attempt} 次重试…` });
@@ -358,6 +425,8 @@ function generationSummary(job) {
     updatedAt: job.updatedAt,
     result: job.result,
     error: job.error,
+    failure: job.failure || null,
+    attempts: job.attempts,
   };
 }
 
@@ -559,81 +628,40 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
       if (Array.isArray(sj.history)) history = sj.history.slice(-10);
     } catch {}
   }
+  const complexity = isIteration
+    ? assessRequestComplexity(prompt, { history, htmlLength: existingHtml.length })
+    : { level: "simple", score: 0, reasons: [] };
+  if (isIteration && complexity.level !== "simple") {
+    sse({ type: "status", text: complexity.level === "complex" ? "正在分析相关代码和历史…" : "正在准备应用上下文…" });
+  }
   const messages = isIteration
     ? [
         { role: "system", content: ITERATE_SYSTEM_PROMPT },
-        ...history.map((h) => ({ role: "user", content: h })),
-        { role: "user", content: "现有应用的完整 HTML：\n```html\n" + existingHtml + "\n```\n\n用户的修改要求：\n" + prompt },
+        { role: "user", content: buildIterationUserContext(prompt, existingHtml, history, complexity) },
       ]
     : [
         { role: "system", content: SYSTEM_PROMPT },
         { role: "user", content: "需求：\n" + prompt },
       ];
-  let upstream;
+  let raw = "";
   try {
-    upstream = await fetch(DEEPSEEK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + DEEPSEEK_KEY },
-      body: JSON.stringify({ model: MODEL, messages, stream: true, temperature: 0.7, thinking: { type: THINKING } }),
-      signal,
+    let inCode = false;
+    await streamChat({ ...MODEL_OPTIONS, thinking: THINKING }, messages, signal, (c) => {
+      raw += c;
+      if (!inCode) {
+        const fenceIdx = raw.indexOf("```");
+        if (fenceIdx === -1) sse({ type: "feedback", text: c });
+        else {
+          inCode = true;
+          const consumedBefore = raw.length - c.length;
+          const fenceLocal = fenceIdx - consumedBefore;
+          if (fenceLocal > 0) sse({ type: "feedback", text: c.slice(0, fenceLocal) });
+          sse({ type: "status", text: "正在生成代码…" });
+        }
+      }
     });
   } catch (e) {
-    sse({ type: "error", message: "请求 DeepSeek 失败（网络错误）：" + e.message });
-    res.end();
-    return;
-  }
-  if (!upstream.ok) {
-    let detail = "";
-    try { detail = (await upstream.text()).slice(0, 300); } catch {}
-    sse({ type: "error", message: "DeepSeek 返回 " + upstream.status + "：" + detail });
-    res.end();
-    return;
-  }
-
-  const reader = upstream.body.getReader();
-  let raw = "";
-  let inCode = false;
-  const decoder = new TextDecoder();
-  let lastFlush = Date.now();
-  // 关键：SSE 事件可能被 TCP 拆分到多次 read()，必须跨读取缓冲，
-  // 攒够完整的 "\n\n" 分隔事件再解析，否则半个 JSON 会整块丢失。
-  let sseBuf = "";
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      sseBuf += decoder.decode(value, { stream: true });
-      const parts = sseBuf.split("\n\n");
-      sseBuf = parts.pop();
-      for (const part of parts) {
-        parseSSE(part, (j) => {
-          const delta = j.choices && j.choices[0] && j.choices[0].delta;
-          if (delta && delta.content) {
-            const c = delta.content;
-            raw += c;
-            if (!inCode) {
-              const fenceIdx = raw.indexOf("```");
-              if (fenceIdx === -1) {
-                sse({ type: "feedback", text: c });
-              } else {
-                inCode = true;
-                const consumedBefore = raw.length - c.length;
-                const fenceLocal = fenceIdx - consumedBefore;
-                if (fenceLocal > 0) sse({ type: "feedback", text: c.slice(0, fenceLocal) });
-                sse({ type: "status", text: "正在生成代码…" });
-              }
-            }
-            lastFlush = Date.now();
-          }
-        });
-      }
-      if (Date.now() - lastFlush > 15000) {
-        sse({ type: "ping" });
-        lastFlush = Date.now();
-      }
-    }
-  } catch (e) {
-    sse({ type: "error", message: "读取流中断：" + e.message });
+    sse({ type: "error", message: "请求 DeepSeek 失败：" + e.message });
     res.end();
     return;
   }
@@ -687,11 +715,11 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
   if (BROWSER_VALIDATION) {
     sse({ type: "status", text: "正在用无头浏览器验证…" });
-    let validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
+    let validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
     if (!validation.ok) {
       sse({ type: "status", text: "验证发现问题，正在自动修复…" });
       try {
-        const repairedHtml = await requestRepairHtml(html, validation.errors, signal);
+        const repairedHtml = await requestRepairHtml(html, validation.errors, signal, prompt, history);
         const repairError = validateGeneratedHtml(repairedHtml);
         if (repairError) throw new Error(repairError);
         html = repairedHtml;
@@ -701,7 +729,7 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
         fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
         fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
         sse({ type: "step", icon: "🔧", text: "已根据浏览器错误自动修复" });
-        validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE);
+        validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
       } catch (repairError) {
         sse({ type: "error", message: "浏览器验证失败，自动修复也未通过：" + (repairError instanceof Error ? repairError.message : String(repairError)) });
         res.end();
@@ -731,7 +759,15 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   const previousSession = readSession(appDir);
   const previousConversation = Array.isArray(previousSession.conversation) ? previousSession.conversation : [];
   const conversation = [...previousConversation, ...conversationFromEvents(timeline, prompt)].slice(-120);
-  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation }));
+  const commit = recordVersion(appDir, {
+    version: newVersion,
+    action: isIteration ? "iterate" : "create",
+    message: isIteration ? "迭代应用：" + shortPrompt : "创建应用：" + title,
+    prompt,
+    changes: [{ path: "index.html", changed: true, addedChars: html.length, removedChars: isIteration && existingHtml ? existingHtml.length : 0 }],
+    validation: BROWSER_VALIDATION ? "passed" : "skipped",
+  });
+  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation, head: commit.commitId }));
   res.end();
 }
 
@@ -746,9 +782,97 @@ function serveApp(res, id, rel) {
   const base = path.join(APPS_DIR, id);
   if (!base.startsWith(APPS_DIR)) return sendText(res, 404, "not found", "text/plain");
   const relSafe = rel.split("/").filter((s) => s && s !== "..").join("/");
+  // Chrome may request a conventional favicon even when the PWA only ships an SVG icon.
+  if (relSafe === "favicon.ico" && fs.existsSync(path.join(base, "icon.svg"))) {
+    return sendText(res, 200, fs.readFileSync(path.join(base, "icon.svg")), "image/svg+xml", { "Cache-Control": "no-cache" });
+  }
   const p = path.join(base, relSafe || "index.html");
   if (!p.startsWith(base) || !fs.existsSync(p) || !fs.statSync(p).isFile()) return sendText(res, 404, "not found", "text/plain");
   sendText(res, 200, fs.readFileSync(p), MIME[path.extname(p)] || "application/octet-stream", { "Cache-Control": "no-cache" });
+}
+
+function atomicWriteFiles(dir, files) {
+  const tempDir = fs.mkdtempSync(path.join(dir, ".patch-"));
+  try {
+    for (const [relativePath, content] of Object.entries(files)) {
+      const safePath = assertSafeBundlePath(relativePath);
+      const tempPath = path.join(tempDir, safePath);
+      fs.mkdirSync(path.dirname(tempPath), { recursive: true });
+      fs.writeFileSync(tempPath, content);
+    }
+    for (const relativePath of Object.keys(files)) {
+      const safePath = assertSafeBundlePath(relativePath);
+      const targetPath = path.join(dir, safePath);
+      const tempPath = path.join(tempDir, safePath);
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      fs.renameSync(tempPath, targetPath);
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function backupBundleFiles(dir, files, version) {
+  const versionDir = path.join(dir, "versions", "v" + version);
+  fs.mkdirSync(versionDir, { recursive: true });
+  for (const relativePath of files) {
+    const safePath = assertSafeBundlePath(relativePath);
+    const sourcePath = path.join(dir, safePath);
+    if (!fs.existsSync(sourcePath)) continue;
+    // Keep the legacy index backup name used by rollback; store auxiliary files below vN/.
+    const targetPath = safePath === "index.html"
+      ? path.join(dir, "versions", "v" + version + ".html")
+      : path.join(versionDir, safePath);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(sourcePath, targetPath);
+  }
+  return versionDir;
+}
+
+function versionHistoryPath(dir) { return path.join(dir, "version-history.json"); }
+
+function readVersionHistory(dir) {
+  const filePath = versionHistoryPath(dir);
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    const history = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return Array.isArray(history) ? history : [];
+  } catch { return []; }
+}
+
+function writeVersionHistory(dir, history) {
+  fs.writeFileSync(versionHistoryPath(dir), JSON.stringify(history, null, 2));
+}
+
+function bundleDigest(files) {
+  const hash = crypto.createHash("sha256");
+  for (const filePath of Object.keys(files).sort()) hash.update(filePath + "\0" + files[filePath] + "\0");
+  return hash.digest("hex").slice(0, 12);
+}
+
+function recordVersion(dir, { version, action, message, prompt = null, changes = [], validation = null }) {
+  const history = readVersionHistory(dir);
+  const previous = history[history.length - 1] || null;
+  const files = {};
+  for (const filePath of ["index.html", "manifest.json", "sw.js", "icon.svg"]) {
+    const fullPath = path.join(dir, filePath);
+    if (fs.existsSync(fullPath)) files[filePath] = fs.readFileSync(fullPath, "utf8");
+  }
+  const entry = {
+    commitId: "c" + String(history.length + 1).padStart(6, "0"),
+    parent: previous ? previous.commitId : null,
+    version,
+    action,
+    message,
+    prompt,
+    changes,
+    validation,
+    digest: bundleDigest(files),
+    createdAt: new Date().toISOString(),
+  };
+  history.push(entry);
+  writeVersionHistory(dir, history);
+  return entry;
 }
 
 /* ---------- HTTP 路由 ---------- */
@@ -857,10 +981,13 @@ const server = http.createServer((req, res) => {
           if (!filePath.startsWith(dir) || !fs.existsSync(filePath)) throw new Error("文件不存在：" + safePath);
           files[safePath] = fs.readFileSync(filePath, "utf8");
         }
-        const patched = applySearchReplace({ entry: "index.html", files }, body.patches);
+        const beforeBundle = { entry: "index.html", files };
+        const patched = applySearchReplace(beforeBundle, body.patches);
         if (!patched.files["index.html"]) throw new Error("Patch 必须包含 index.html");
         const validationError = validateGeneratedHtml(patched.files["index.html"]);
         if (validationError) throw new Error(validationError);
+        const changes = summarizeBundleChanges(beforeBundle, patched);
+        if (!changes.length) throw new Error("Patch 没有产生实际变化");
         const sessionPath = path.join(dir, "session.json");
         let version = 1;
         let history = [];
@@ -873,13 +1000,19 @@ const server = http.createServer((req, res) => {
             conversation = Array.isArray(session.conversation) ? session.conversation : [];
           } catch {}
         }
-        fs.mkdirSync(path.join(dir, "versions"), { recursive: true });
-        fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
-        for (const [filePath, content] of Object.entries(patched.files)) fs.writeFileSync(path.join(dir, filePath), content);
+        backupBundleFiles(dir, changes.map((item) => item.path), version);
+        atomicWriteFiles(dir, patched.files);
         const newVersion = version + 1;
         const title = extractTitle(patched.files["index.html"]);
-        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + body.patches.map((item) => item.path).join(", ")].slice(-20), conversation }));
-        return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
+        const commit = recordVersion(dir, {
+          version: newVersion,
+          action: "patch",
+          message: "应用 Patch：" + changes.map((item) => item.path).join(", "),
+          changes,
+          validation: "passed",
+        });
+        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation, head: commit.commitId }));
+        return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, changes, url: BASE_URL + "/apps/" + id + "/" });
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -909,7 +1042,8 @@ const server = http.createServer((req, res) => {
     if (!title || title === "未命名应用") {
       try { title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8")); } catch {}
     }
-    return sendJson(res, 200, { app: { id, title, version, versions: 0, updatedAt, history, conversation, url: BASE_URL + "/apps/" + id + "/" } });
+    const versionHistory = readVersionHistory(dir);
+    return sendJson(res, 200, { app: { id, title, version, versions: versionHistory.length, updatedAt, history, conversation, head: versionHistory[versionHistory.length - 1]?.commitId || null, versionHistory, url: BASE_URL + "/apps/" + id + "/" } });
   }
   // 删除应用（需口令）
   if (req.method === "DELETE" && delMatch) {
@@ -946,9 +1080,16 @@ const server = http.createServer((req, res) => {
     fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
     fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
     const session = readSession(dir);
-    fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString() }));
+    const commit = recordVersion(dir, {
+      version: newVersion,
+      action: "rollback",
+      message: "回退到版本 v" + newVersion,
+      changes: [{ path: "index.html", changed: true, addedChars: 0, removedChars: 0 }],
+      validation: "not-run",
+    });
+    fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString(), head: commit.commitId }));
     console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
-    return sendJson(res, 200, { ok: true, id, version: newVersion, title, url: BASE_URL + "/apps/" + id + "/" });
+    return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, url: BASE_URL + "/apps/" + id + "/" });
   }
   if (req.method === "POST" && p === "/api/generate") {
     let bodyText = "";
@@ -992,4 +1133,18 @@ if (require.main === module || path.basename(process.argv[1] || "") === "server.
   });
 }
 
-module.exports = { extractHtml, extractTitle, validateGeneratedHtml, genId, genManifest, genIcon, deploy, parseSSE, SW_JS };
+module.exports = {
+  extractHtml,
+  extractTitle,
+  validateGeneratedHtml,
+  genId,
+  genManifest,
+  genIcon,
+  deploy,
+  parseSSE,
+  assessRequestComplexity,
+  extractRelevantHtml,
+  buildIterationUserContext,
+  buildRepairPrompt,
+  SW_JS,
+};

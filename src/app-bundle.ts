@@ -36,3 +36,19 @@ export function applySearchReplace(bundle: AppBundle, patches: SearchReplacePatc
   }
   return { entry: bundle.entry, files };
 }
+
+export function summarizeBundleChanges(before: AppBundle, after: AppBundle): Array<{ path: string; changed: boolean; addedChars: number; removedChars: number }> {
+  const paths = [...new Set([...Object.keys(before.files), ...Object.keys(after.files)])].sort();
+  return paths
+    .map((path) => {
+      const oldText = before.files[path] || "";
+      const newText = after.files[path] || "";
+      return {
+        path,
+        changed: oldText !== newText,
+        addedChars: Math.max(0, newText.length - oldText.length),
+        removedChars: Math.max(0, oldText.length - newText.length),
+      };
+    })
+    .filter((item) => item.changed);
+}

@@ -42,10 +42,20 @@ test.before(async () => {
   port = await freePort();
   upstreamPort = await freePort();
   upstream = http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const html = "<!DOCTYPE html><html><head><title>测试应用</title></head><body><script>" + "const value = 1;\n" + "console.log(value);\n".repeat(30) + "</script></body></html>";
-    const content = "测试生成完成。\n```html\n" + html + "\n```";
-    setTimeout(() => res.end("data: " + JSON.stringify({ choices: [{ delta: { content } }] }) + "\n\ndata: [DONE]\n\n"), 120);
+    let requestBody = "";
+    req.on("data", (chunk) => { requestBody += chunk; });
+    req.on("end", () => {
+      const request = JSON.parse(requestBody || "{}");
+      const repairedHtml = "<!DOCTYPE html><html><head><title>测试应用</title></head><body><script>" + "const value = 1;\n" + "console.log(value);\n".repeat(30) + "</script></body></html>";
+      if (request.stream === false) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ choices: [{ message: { content: "```html\n" + repairedHtml + "\n```" } }] }));
+      }
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const html = repairedHtml.replace("console.log(value);", "console.log(value); throw new Error('intentional browser validation failure');");
+      const content = "测试生成完成。\n```html\n" + html + "\n```";
+      setTimeout(() => res.end("data: " + JSON.stringify({ choices: [{ delta: { content } }] }) + "\n\ndata: [DONE]\n\n"), 120);
+    });
   });
   await new Promise((resolve) => upstream.listen(upstreamPort, "127.0.0.1", resolve));
   appsDir = fs.mkdtempSync(path.join("/tmp", "chat2app-test-"));
@@ -142,6 +152,7 @@ test("generation API creates a task and replays its completed SSE events", async
   const status = await statusResponse.json();
   assert.equal(status.status, "completed");
   assert.equal(status.result.title, "测试应用");
+  assert.equal(status.result.version, 1);
   generatedAppId = status.result.id;
 
   const sessionResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}`, { headers });
@@ -168,8 +179,55 @@ test("apps patch API updates one file and increments the app version", async () 
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.version, 2);
+  assert.deepEqual(body.changes, [{ path: "index.html", changed: true, addedChars: 2, removedChars: 0 }]);
+  assert.equal(body.commit.commitId, "c000002");
+  assert.equal(body.commit.parent, "c000001");
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);
   assert.match(await appResponse.text(), /测试应用二版/);
+
+  const rollbackResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}/rollback`, {
+    method: "POST",
+    headers,
+  });
+  assert.equal(rollbackResponse.status, 200);
+  const rollback = await rollbackResponse.json();
+  assert.equal(rollback.version, 1);
+  assert.equal(rollback.commit.commitId, "c000003");
+  assert.equal(rollback.commit.parent, "c000002");
+  const rolledBackAppResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);
+  const rolledBackHtml = await rolledBackAppResponse.text();
+  assert.match(rolledBackHtml, /测试应用/);
+  assert.doesNotMatch(rolledBackHtml, /测试应用二版/);
+
+  const detailResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}`, { headers });
+  const detail = await detailResponse.json();
+  assert.equal(detail.app.head, "c000003");
+  assert.deepEqual(detail.app.versionHistory.map((entry) => entry.action), ["create", "patch", "rollback"]);
+});
+
+test("patch API validates all patches before writing and rejects no-op patches", async () => {
+  const headers = { "Content-Type": "application/json", Authorization: "Bearer test-token" };
+  const beforeResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);
+  const beforeHtml = await beforeResponse.text();
+  const failedResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}/patch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ patches: [
+      { path: "index.html", search: "测试应用", replace: "不会写入" },
+      { path: "index.html", search: "不存在的片段", replace: "x" },
+    ] }),
+  });
+  assert.equal(failedResponse.status, 400);
+  const afterFailedResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);
+  assert.equal(await afterFailedResponse.text(), beforeHtml);
+
+  const noOpResponse = await fetch(`http://127.0.0.1:${port}/api/apps/${generatedAppId}/patch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ patches: [{ path: "index.html", search: "测试应用", replace: "测试应用" }] }),
+  });
+  assert.equal(noOpResponse.status, 400);
+  assert.match(await noOpResponse.text(), /没有产生实际变化/);
 });
 
 test("generation API can cancel a running task", async () => {
