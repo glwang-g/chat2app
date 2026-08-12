@@ -145,6 +145,8 @@ test("generation API creates a task and replays its completed SSE events", async
   assert.equal(eventsResponse.status, 200);
   const eventsText = await eventsResponse.text();
   assert.match(eventsText, /"type":"done"/);
+  assert.match(eventsText, /"type":"edit"/);
+  assert.match(eventsText, /"mode":"full"/);
   assert.match(eventsText, /测试应用/);
 
   const statusResponse = await fetch(`http://127.0.0.1:${port}${task.statusUrl}`, { headers });
@@ -163,6 +165,8 @@ test("generation API creates a task and replays its completed SSE events", async
   assert.ok(sessionBody.app.conversation.some((entry) => entry.kind === "feedback" && entry.content.includes("测试生成完成")));
   assert.equal(sessionBody.app.conversation.filter((entry) => entry.kind === "step").length, 1);
   assert.match(sessionBody.app.conversation.find((entry) => entry.kind === "step").content, /代码生成、PWA 打包、验证并发布/);
+  assert.equal(sessionBody.app.workflow.editMode, "full");
+  assert.equal(sessionBody.app.workflow.validation.status, "skipped");
 
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${status.result.id}/`);
   assert.equal(appResponse.status, 200);
@@ -180,6 +184,7 @@ test("apps patch API updates one file and increments the app version", async () 
   const body = await response.json();
   assert.equal(body.version, 2);
   assert.deepEqual(body.changes, [{ path: "index.html", changed: true, addedChars: 2, removedChars: 0 }]);
+  assert.equal(body.commit.validation, "passed");
   assert.equal(body.commit.commitId, "c000002");
   assert.equal(body.commit.parent, "c000001");
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${generatedAppId}/`);

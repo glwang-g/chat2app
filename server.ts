@@ -213,6 +213,20 @@ function buildIterationUserContext(prompt, html, history, complexity) {
   return `${scope}\n\n历史需求：\n${historyText}\n\n当前应用代码：\n\`\`\`html\n${htmlText}\n\`\`\`\n\n用户的修改要求：\n${prompt}`;
 }
 
+function buildContextPlan(prompt, html, history, complexity, errors = []) {
+  const fullHtmlChars = html.length;
+  const selectedHtml = complexity.level === "complex" ? extractRelevantHtml(html, prompt, errors, 14000) : html;
+  return {
+    strategy: complexity.level === "simple" ? "current-document" : "focused-context",
+    complexity: complexity.level,
+    historyEntries: history.length,
+    fullHtmlChars,
+    selectedHtmlChars: selectedHtml.length,
+    selectedHtmlRatio: fullHtmlChars ? Number((selectedHtml.length / fullHtmlChars).toFixed(3)) : 0,
+    reasons: complexity.reasons,
+  };
+}
+
 function buildRepairPrompt(html, errors, prompt = "", history = []) {
   const complexity = assessRequestComplexity(prompt || "修复浏览器错误", { browserErrors: errors, htmlLength: html.length, history });
   const relevant = complexity.level === "complex" ? extractRelevantHtml(html, prompt, errors) : html;
@@ -319,6 +333,21 @@ function conversationFromEvents(events, prompt) {
   flushFeedback();
   if (hasProcess) entries.push({ role: "assistant", content: "✅ 已完成：代码生成、PWA 打包、验证并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() });
   return entries;
+}
+
+function appendSessionConversation(dir, entries) {
+  if (!dir || !fs.existsSync(dir)) return;
+  const sessionPath = path.join(dir, "session.json");
+  const session = readSession(dir);
+  const conversation = Array.isArray(session.conversation) ? session.conversation : [];
+  fs.writeFileSync(sessionPath, JSON.stringify({ ...session, conversation: [...conversation, ...entries].slice(-160), updatedAt: new Date().toISOString() }));
+}
+
+function failureConversation(prompt, events, message) {
+  return [
+    ...conversationFromEvents(events, prompt),
+    { role: "assistant", content: "❌ " + message, kind: "error", icon: "❌", createdAt: new Date().toISOString() },
+  ];
 }
 
 function createGenerationJob(bodyText, ip) {
@@ -631,9 +660,11 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   const complexity = isIteration
     ? assessRequestComplexity(prompt, { history, htmlLength: existingHtml.length })
     : { level: "simple", score: 0, reasons: [] };
+  const contextPlan = isIteration ? buildContextPlan(prompt, existingHtml, history, complexity) : null;
   if (isIteration && complexity.level !== "simple") {
     sse({ type: "status", text: complexity.level === "complex" ? "正在分析相关代码和历史…" : "正在准备应用上下文…" });
   }
+  if (contextPlan) sse({ type: "context", plan: contextPlan });
   const messages = isIteration
     ? [
         { role: "system", content: ITERATE_SYSTEM_PROMPT },
@@ -677,8 +708,10 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   let parsedOutput = parseGeneratedOutput(raw, isIteration ? existingHtml : null);
   let feedback = parsedOutput.feedback;
   let html = parsedOutput.html;
+  sse({ type: "edit", mode: parsedOutput.mode, text: parsedOutput.mode === "patch" ? "已应用增量 Patch" : "使用完整 HTML 结果" });
   let validationError = validateGeneratedHtml(html);
   if (validationError) {
+    sse({ type: "failure", phase: "generated-output", message: validationError });
     sse({ type: "error", message: validationError });
     res.end();
     return;
@@ -717,8 +750,10 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
     sse({ type: "status", text: "正在用无头浏览器验证…" });
     let validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
     if (!validation.ok) {
+      sse({ type: "validation", status: "failed", errors: validation.errors, interactions: validation.interactions || [] });
       sse({ type: "status", text: "验证发现问题，正在自动修复…" });
       try {
+        sse({ type: "repair", status: "started", errors: validation.errors });
         const repairedHtml = await requestRepairHtml(html, validation.errors, signal, prompt, history);
         const repairError = validateGeneratedHtml(repairedHtml);
         if (repairError) throw new Error(repairError);
@@ -730,12 +765,18 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
         fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
         sse({ type: "step", icon: "🔧", text: "已根据浏览器错误自动修复" });
         validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
+        sse({ type: "repair", status: validation.ok ? "passed" : "failed", errors: validation.errors, interactions: validation.interactions || [] });
       } catch (repairError) {
+        const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
+        sse({ type: "repair", status: "failed", errors: [repairMessage] });
+        appendSessionConversation(appDir, failureConversation(prompt, timeline, "浏览器验证失败，自动修复也未通过：" + repairMessage));
         sse({ type: "error", message: "浏览器验证失败，自动修复也未通过：" + (repairError instanceof Error ? repairError.message : String(repairError)) });
         res.end();
         return;
       }
       if (!validation.ok) {
+        appendSessionConversation(appDir, failureConversation(prompt, timeline, "自动修复后浏览器验证仍失败：" + validation.errors.join("；")));
+        sse({ type: "failure", phase: "browser-validation", errors: validation.errors, interactions: validation.interactions || [] });
         sse({ type: "error", message: "自动修复后浏览器验证仍失败：" + validation.errors.join("；") });
         res.end();
         return;
@@ -765,9 +806,9 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
     message: isIteration ? "迭代应用：" + shortPrompt : "创建应用：" + title,
     prompt,
     changes: [{ path: "index.html", changed: true, addedChars: html.length, removedChars: isIteration && existingHtml ? existingHtml.length : 0 }],
-    validation: BROWSER_VALIDATION ? "passed" : "skipped",
+    validation: BROWSER_VALIDATION ? { status: "passed", browser: BROWSER_EXECUTABLE } : { status: "skipped" },
   });
-  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation, head: commit.commitId }));
+  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation, head: commit.commitId, workflow: { context: contextPlan, editMode: parsedOutput.mode, validation: commit.validation } }));
   res.end();
 }
 
@@ -1004,6 +1045,7 @@ const server = http.createServer((req, res) => {
         atomicWriteFiles(dir, patched.files);
         const newVersion = version + 1;
         const title = extractTitle(patched.files["index.html"]);
+        const patchConversation = [...conversation, { role: "user", content: "应用增量 Patch：" + changes.map((item) => item.path).join(", "), kind: "message", createdAt: new Date().toISOString() }, { role: "assistant", content: "✅ 已完成：Patch 校验、Diff、版本快照并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() }].slice(-160);
         const commit = recordVersion(dir, {
           version: newVersion,
           action: "patch",
@@ -1011,7 +1053,7 @@ const server = http.createServer((req, res) => {
           changes,
           validation: "passed",
         });
-        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation, head: commit.commitId }));
+        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation: patchConversation, head: commit.commitId, workflow: { editMode: "patch", validation: "passed", changes } }));
         return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, changes, url: BASE_URL + "/apps/" + id + "/" });
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -1027,7 +1069,7 @@ const server = http.createServer((req, res) => {
     const id = delMatch[1];
     const dir = path.join(APPS_DIR, id);
     if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
-    let title = "未命名应用", version = 1, updatedAt = null, history = [], conversation = [];
+    let title = "未命名应用", version = 1, updatedAt = null, history = [], conversation = [], workflow = null;
     const sp = path.join(dir, "session.json");
     if (fs.existsSync(sp)) {
       try {
@@ -1037,13 +1079,14 @@ const server = http.createServer((req, res) => {
         if (sj.updatedAt) updatedAt = sj.updatedAt;
         if (Array.isArray(sj.history)) history = sj.history;
         if (Array.isArray(sj.conversation)) conversation = sj.conversation;
+        if (sj.workflow) workflow = sj.workflow;
       } catch {}
     }
     if (!title || title === "未命名应用") {
       try { title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8")); } catch {}
     }
     const versionHistory = readVersionHistory(dir);
-    return sendJson(res, 200, { app: { id, title, version, versions: versionHistory.length, updatedAt, history, conversation, head: versionHistory[versionHistory.length - 1]?.commitId || null, versionHistory, url: BASE_URL + "/apps/" + id + "/" } });
+    return sendJson(res, 200, { app: { id, title, version, versions: versionHistory.length, updatedAt, history, conversation, workflow, head: versionHistory[versionHistory.length - 1]?.commitId || null, versionHistory, url: BASE_URL + "/apps/" + id + "/" } });
   }
   // 删除应用（需口令）
   if (req.method === "DELETE" && delMatch) {
