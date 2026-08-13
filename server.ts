@@ -9,13 +9,13 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const crypto = require("node:crypto");
-const { execFile } = require("node:child_process");
-const { promisify } = require("node:util");
-const execFileP = promisify(execFile);
 const { bundleFromHtml, applySearchReplace, assertSafeBundlePath, summarizeBundleChanges } = require("./src/app-bundle");
 const { validateInBrowser } = require("./src/browser-validator");
 const { streamChat, completeChat } = require("./src/model-adapter");
+const { createAppStore } = require("./src/app-store");
+const { createGenerationManager } = require("./src/generation-jobs");
+const { SW_JS, genManifest, genIcon, createPublisher } = require("./src/app-publisher");
+const { createAppRoutes } = require("./src/app-routes");
 
 /** @typedef {import("./src/contracts").AppManifest} AppManifest */
 /** @typedef {import("./src/contracts").AppSession} AppSession */
@@ -256,104 +256,11 @@ function checkAuth(req) {
   return h === "Bearer " + API_TOKEN ? null : "访问口令错误";
 }
 const rateMap = new Map();
-const generationJobs = new Map();
-const generationQueue = [];
-const appLocks = new Map();
-let activeGenerations = 0;
 const GENERATION_TTL = 30 * 60 * 1000;
 const GENERATION_CONCURRENCY = Math.max(1, Number(process.env.GENERATION_CONCURRENCY || config.generationConcurrency || 2));
 const GENERATION_MAX_RETRIES = Math.max(0, Number(process.env.GENERATION_MAX_RETRIES || config.generationMaxRetries || 2));
-
-function taskFile(id) { return path.join(TASKS_DIR, id + ".json"); }
-function persistGenerationJob(job) {
-  fs.mkdirSync(TASKS_DIR, { recursive: true });
-  const saved = { ...job, listeners: undefined, controller: undefined };
-  const tmp = taskFile(job.id) + ".tmp";
-  fs.writeFileSync(tmp, JSON.stringify(saved));
-  fs.renameSync(tmp, taskFile(job.id));
-}
-
-function loadGenerationJobs() {
-  if (!fs.existsSync(TASKS_DIR)) return;
-  for (const name of fs.readdirSync(TASKS_DIR)) {
-    if (!/^([a-z0-9]+)\.json$/i.test(name)) continue;
-    try {
-      const job = JSON.parse(fs.readFileSync(path.join(TASKS_DIR, name), "utf8"));
-      job.listeners = new Set();
-      if (job.status === "running" || job.status === "queued") {
-        job.status = "interrupted";
-        job.error = "服务在任务执行期间重启，请点击重试。";
-        job.updatedAt = new Date().toISOString();
-      }
-      generationJobs.set(job.id, job);
-      persistGenerationJob(job);
-    } catch (error) {
-      if (process.env.DEBUG) console.error("[debug] 无法读取任务：", name, error);
-    }
-  }
-}
-
-function emitGeneration(job, event) {
-  if (job.status === "cancelled") return;
-  job.events.push(event);
-  job.updatedAt = new Date().toISOString();
-  if (event.type === "done") {
-    job.status = "completed";
-    job.result = event.result;
-  } else if (event.type === "error") {
-    job.status = "failed";
-    job.error = event.message || "生成失败";
-    job.failure = { message: job.error, events: job.events.slice(-40), attempt: job.attempts, updatedAt: job.updatedAt };
-  }
-  persistGenerationJob(job);
-  for (const listener of job.listeners || []) listener(event);
-}
-
-function readSession(dir) {
-  const sessionPath = path.join(dir, "session.json");
-  if (!fs.existsSync(sessionPath)) return {};
-  try {
-    const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
-    return session && typeof session === "object" ? session : {};
-  } catch { return {}; }
-}
-
-function writeSession(dir, patch) {
-  if (!dir || !fs.existsSync(dir)) return;
-  const sessionPath = path.join(dir, "session.json");
-  const session = readSession(dir);
-  fs.writeFileSync(sessionPath, JSON.stringify({ ...session, ...patch, updatedAt: new Date().toISOString() }));
-}
-
-function updateSessionWorkflow(dir, patch) {
-  const session = readSession(dir);
-  const workflow = { ...(session.workflow || {}), ...patch };
-  writeSession(dir, { workflow });
-}
-
-function acquireAppLock(id, action) {
-  const current = appLocks.get(id);
-  if (current) {
-    const error = new Error(`应用 ${id} 正在执行 ${current.action}，请稍后重试`);
-    (error as any).statusCode = 409;
-    throw error;
-  }
-  const lock = { action, startedAt: new Date().toISOString() };
-  appLocks.set(id, lock);
-  return () => {
-    const existing = appLocks.get(id);
-    if (existing && existing.action === action && existing.startedAt === lock.startedAt) appLocks.delete(id);
-  };
-}
-
-async function withAppLock(id, action, fn) {
-  const release = acquireAppLock(id, action);
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
-}
+const appStore = createAppStore();
+const { readSession, writeSession, updateSessionWorkflow, appendSessionConversation, withAppLock, atomicWriteFiles, backupBundleFiles, readVersionHistory, recordVersion, finalizeAppCommit } = appStore;
 
 function conversationFromEvents(events, prompt) {
   const entries = [{ role: "user", content: prompt, kind: "message", icon: undefined, createdAt: new Date().toISOString() }];
@@ -373,14 +280,6 @@ function conversationFromEvents(events, prompt) {
   return entries;
 }
 
-function appendSessionConversation(dir, entries) {
-  if (!dir || !fs.existsSync(dir)) return;
-  const sessionPath = path.join(dir, "session.json");
-  const session = readSession(dir);
-  const conversation = Array.isArray(session.conversation) ? session.conversation : [];
-  fs.writeFileSync(sessionPath, JSON.stringify({ ...session, conversation: [...conversation, ...entries].slice(-160), updatedAt: new Date().toISOString() }));
-}
-
 function failureConversation(prompt, events, message) {
   return [
     ...conversationFromEvents(events, prompt),
@@ -388,114 +287,6 @@ function failureConversation(prompt, events, message) {
   ];
 }
 
-function createGenerationJob(bodyText, ip) {
-  const id = genId();
-  const now = new Date().toISOString();
-  const job = { id, status: "queued", createdAt: now, updatedAt: now, events: [], result: null, error: null, failure: null, attempts: 0, requestBody: bodyText, ip, listeners: new Set() };
-  generationJobs.set(id, job);
-  persistGenerationJob(job);
-  setTimeout(() => {
-    const current = generationJobs.get(id);
-    if (current && Date.now() - Date.parse(current.updatedAt) > GENERATION_TTL) generationJobs.delete(id);
-  }, GENERATION_TTL + 1000).unref?.();
-  return job;
-}
-
-function enqueueGenerationJob(job, req) {
-  generationQueue.push({ job, req });
-  job.status = "queued";
-  job.updatedAt = new Date().toISOString();
-  persistGenerationJob(job);
-  pumpGenerationQueue();
-}
-
-function pumpGenerationQueue() {
-  while (activeGenerations < GENERATION_CONCURRENCY && generationQueue.length) {
-    const item = generationQueue.shift();
-    if (item.job.status === "cancelled") continue;
-    activeGenerations++;
-    void runGenerationJob(item.job, item.req).finally(() => {
-      activeGenerations--;
-      pumpGenerationQueue();
-    });
-  }
-}
-
-async function runGenerationJob(job, req) {
-  const bodyText = job.requestBody;
-  const ip = job.ip || "?";
-  for (let attempt = job.attempts + 1; attempt <= GENERATION_MAX_RETRIES + 1; attempt++) {
-    if (job.status === "cancelled") return;
-    job.status = "running";
-    job.attempts = attempt;
-    job.error = null;
-    job.failure = null;
-    job.updatedAt = new Date().toISOString();
-    persistGenerationJob(job);
-    if (attempt > 1) emitGeneration(job, { type: "status", text: `正在进行第 ${attempt} 次重试…` });
-    job.controller = new AbortController();
-  const sink = {
-    statusCode: 200,
-    writeHead(code) { this.statusCode = code; },
-    write(chunk) {
-      const text = String(chunk);
-      for (const part of text.split("\n\n")) {
-        const line = part.split("\n").find((item) => item.startsWith("data:"));
-        if (!line) continue;
-        try {
-          const event = JSON.parse(line.slice(5).trim());
-          if (event.type === "error") event.retryable = job.attempts <= GENERATION_MAX_RETRIES;
-          emitGeneration(job, event);
-        } catch {}
-      }
-    },
-    end(body) {
-      if (this.statusCode >= 400 && body) {
-        try { emitGeneration(job, { type: "error", message: JSON.parse(String(body)).error || "生成请求失败" }); } catch {}
-      }
-    },
-  };
-  try {
-    await handleGenerate(req, sink, bodyText, ip, true, job.controller.signal);
-    if (job.status === "running") emitGeneration(job, { type: "error", message: "生成任务意外结束" });
-  } catch (error) {
-    if (job.status !== "cancelled") emitGeneration(job, { type: "error", message: error instanceof Error ? error.message : String(error), retryable: attempt <= GENERATION_MAX_RETRIES });
-  }
-    job.controller = undefined;
-    if (job.status === "completed" || job.status === "cancelled") return;
-    if (attempt <= GENERATION_MAX_RETRIES) {
-      emitGeneration(job, { type: "status", text: "本次生成失败，准备自动重试…" });
-      continue;
-    }
-    return;
-  }
-}
-
-function cancelGenerationJob(job) {
-  if (["completed", "failed", "cancelled"].includes(job.status)) return false;
-  job.status = "cancelled";
-  job.error = "任务已取消";
-  job.updatedAt = new Date().toISOString();
-  if (job.controller) job.controller.abort();
-  const event = { type: "cancelled", message: job.error };
-  job.events.push(event);
-  persistGenerationJob(job);
-  for (const listener of job.listeners || []) listener(event);
-  return true;
-}
-
-function generationSummary(job) {
-  return {
-    generationId: job.id,
-    status: job.status,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    result: job.result,
-    error: job.error,
-    failure: job.failure || null,
-    attempts: job.attempts,
-  };
-}
 
 function checkRate(ip) {
   if (!RATE_LIMIT) return null;
@@ -556,95 +347,7 @@ function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 /** @param {string} name @param {string} [theme] @returns {AppManifest} */
-function genManifest(name, theme) {
-  const short = name.replace(/\s*[·｜|].*$/, "").slice(0, 12) || "小应用";
-  return {
-    name, short_name: short, lang: "zh-CN",
-    start_url: "./", scope: "./", display: "standalone",
-    background_color: "#0f1420", theme_color: theme || "#4f8cff",
-    icons: [{ src: "icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any maskable" }],
-  };
-}
-const SW_JS = `/* Chat2App 生成的 Service Worker：离线可打开 */\nconst C="chat2app-v1";const SHELL=["./","./index.html","./manifest.json","./icon.svg"];\nself.addEventListener("install",e=>{e.waitUntil(caches.open(C).then(c=>c.addAll(SHELL)).then(()=>self.skipWaiting()))});\nself.addEventListener("activate",e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==C).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});\nself.addEventListener("fetch",e=>{const r=e.request;if(r.method!=="GET")return;const u=new URL(r.url);if(u.origin!==self.location.origin)return;const nav=r.mode==="navigate"||u.pathname.endsWith("index.html")||u.pathname.endsWith("/");if(nav){e.respondWith(fetch(r).then(x=>{const c=x.clone();caches.open(C).then(c=>c.put(r,c));return x}).catch(()=>caches.match(r).then(m=>m||caches.match("./index.html"))));return}e.respondWith(caches.match(r).then(m=>m||fetch(r).then(x=>{const c=x.clone();caches.open(C).then(c=>c.put(r,c));return x})))});\n`;
-function genIcon(name) {
-  const letter = (name.replace(/[^A-Za-z0-9\u4e00-\u9fa5]/g, "")[0] || "A").toUpperCase();
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4f8cff"/><stop offset="1" stop-color="#7a5cff"/></linearGradient></defs><rect width="512" height="512" rx="112" fill="url(#g)"/><text x="256" y="332" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="240" font-weight="700" fill="#fff" text-anchor="middle">${letter}</text></svg>`;
-}
-
-/* ---------- 发布（云端默认 local：文件直接落到本机磁盘，由本服务对外提供） ---------- */
-async function deploy(id, files) {
-  const mode = (config.deploy && config.deploy.mode) || "local";
-  if (mode === "local") return { mode, ok: true, detail: "已发布到 /apps/" + id + "/" };
-  if (mode === "ftp") {
-    const f = config.deploy.ftp || {};
-    if (!f.host || !f.user) return { mode, ok: false, detail: "config.json 缺少 deploy.ftp.host/user" };
-    const base = "ftp://" + f.host + (f.pathPrefix || "") + "/apps/" + id;
-    const args = ["-sS", "--ftp-create-dirs", "-u", f.user + ":" + (f.pass || "")];
-    const results = [];
-    for (const file of files) {
-      try {
-        await execFileP("curl", [...args, "-T", path.join(APPS_DIR, id, file), base + "/" + file], { timeout: 30000 });
-        results.push(file + " ✓");
-      } catch (e) {
-        return { mode, ok: false, detail: file + " 上传失败: " + (e.stderr || e.message) };
-      }
-    }
-    return { mode, ok: true, detail: results.join("  ") };
-  }
-  if (mode === "command") {
-    const tmpl = config.deploy.command || "";
-    if (!tmpl) return { mode, ok: false, detail: "config.json 缺少 deploy.command" };
-    const cmd = tmpl.replaceAll("{id}", id).replaceAll("{dir}", path.join(APPS_DIR, id));
-    try {
-      await execFileP("sh", ["-c", cmd], { timeout: 60000 });
-      return { mode, ok: true, detail: "命令执行成功：" + cmd };
-    } catch (e) {
-      return { mode, ok: false, detail: "命令失败: " + (e.stderr || e.message) + "\n命令：" + cmd };
-    }
-  }
-  return { mode, ok: false, detail: "未知发布模式: " + mode };
-}
-
-/* ---------- 应用列表 ---------- */
-function listApps() {
-  if (!fs.existsSync(APPS_DIR)) return [];
-  const apps = [];
-  for (const id of fs.readdirSync(APPS_DIR)) {
-    if (!/^[a-z0-9]+$/i.test(id)) continue;
-    const dir = path.join(APPS_DIR, id);
-    if (!dir.startsWith(APPS_DIR) || !fs.statSync(dir).isDirectory()) continue;
-    const indexHtml = path.join(dir, "index.html");
-    if (!fs.existsSync(indexHtml)) continue;
-    let title = "未命名应用", version = 1, updatedAt = null;
-    const sp = path.join(dir, "session.json");
-    if (fs.existsSync(sp)) {
-      try {
-        const s = JSON.parse(fs.readFileSync(sp, "utf8"));
-        if (s.title) title = s.title;
-        if (typeof s.version === "number") version = s.version;
-        if (s.updatedAt) updatedAt = s.updatedAt;
-      } catch {}
-    }
-    if (!title || title === "未命名应用") {
-      try { title = extractTitle(fs.readFileSync(indexHtml, "utf8")); } catch {}
-    }
-    if (!updatedAt) {
-      try { updatedAt = fs.statSync(indexHtml).mtime.toISOString(); } catch {}
-    }
-    let size = 0;
-    for (const f of ["index.html", "manifest.json", "sw.js", "icon.svg"]) {
-      try { size += fs.statSync(path.join(dir, f)).size; } catch {}
-    }
-    const vDir = path.join(dir, "versions");
-    let versions = 0;
-    if (fs.existsSync(vDir)) {
-      try { versions = fs.readdirSync(vDir).filter((f) => /^v\d+\.html$/.test(f)).length; } catch {}
-    }
-    apps.push({ id, title, version, versions, updatedAt, size, url: BASE_URL + "/apps/" + id + "/" });
-  }
-  apps.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
-  return apps;
-}
+const { deploy, listApps } = createPublisher(APPS_DIR, config, BASE_URL, extractTitle);
 
 /* ---------- 生成主流程 ---------- */
 async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal = undefined) {
@@ -895,104 +598,19 @@ function serveApp(res, id, rel) {
   sendText(res, 200, fs.readFileSync(p), MIME[path.extname(p)] || "application/octet-stream", { "Cache-Control": "no-cache" });
 }
 
-function atomicWriteFiles(dir, files) {
-  const tempDir = fs.mkdtempSync(path.join(dir, ".patch-"));
-  try {
-    for (const [relativePath, content] of Object.entries(files)) {
-      const safePath = assertSafeBundlePath(relativePath);
-      const tempPath = path.join(tempDir, safePath);
-      fs.mkdirSync(path.dirname(tempPath), { recursive: true });
-      fs.writeFileSync(tempPath, content);
-    }
-    for (const relativePath of Object.keys(files)) {
-      const safePath = assertSafeBundlePath(relativePath);
-      const targetPath = path.join(dir, safePath);
-      const tempPath = path.join(tempDir, safePath);
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-      fs.renameSync(tempPath, targetPath);
-    }
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-}
-
-function backupBundleFiles(dir, files, version) {
-  const versionDir = path.join(dir, "versions", "v" + version);
-  fs.mkdirSync(versionDir, { recursive: true });
-  for (const relativePath of files) {
-    const safePath = assertSafeBundlePath(relativePath);
-    const sourcePath = path.join(dir, safePath);
-    if (!fs.existsSync(sourcePath)) continue;
-    // Keep the legacy index backup name used by rollback; store auxiliary files below vN/.
-    const targetPath = safePath === "index.html"
-      ? path.join(dir, "versions", "v" + version + ".html")
-      : path.join(versionDir, safePath);
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    fs.copyFileSync(sourcePath, targetPath);
-  }
-  return versionDir;
-}
-
-function versionHistoryPath(dir) { return path.join(dir, "version-history.json"); }
-
-function readVersionHistory(dir) {
-  const filePath = versionHistoryPath(dir);
-  if (!fs.existsSync(filePath)) return [];
-  try {
-    const history = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return Array.isArray(history) ? history : [];
-  } catch { return []; }
-}
-
-function writeVersionHistory(dir, history) {
-  fs.writeFileSync(versionHistoryPath(dir), JSON.stringify(history, null, 2));
-}
-
-function bundleDigest(files) {
-  const hash = crypto.createHash("sha256");
-  for (const filePath of Object.keys(files).sort()) hash.update(filePath + "\0" + files[filePath] + "\0");
-  return hash.digest("hex").slice(0, 12);
-}
-
-function recordVersion(dir, { version, action, message, prompt = null, changes = [], validation = null }) {
-  const history = readVersionHistory(dir);
-  const previous = history[history.length - 1] || null;
-  const files = {};
-  for (const filePath of ["index.html", "manifest.json", "sw.js", "icon.svg"]) {
-    const fullPath = path.join(dir, filePath);
-    if (fs.existsSync(fullPath)) files[filePath] = fs.readFileSync(fullPath, "utf8");
-  }
-  const entry = {
-    commitId: "c" + String(history.length + 1).padStart(6, "0"),
-    parent: previous ? previous.commitId : null,
-    version,
-    action,
-    message,
-    prompt,
-    changes,
-    validation,
-    digest: bundleDigest(files),
-    createdAt: new Date().toISOString(),
-  };
-  history.push(entry);
-  writeVersionHistory(dir, history);
-  return entry;
-}
-
-function finalizeAppCommit(dir, { version, title, history, conversation, workflow, action, message, prompt = null, changes = [], validation = null }) {
-  const commit = recordVersion(dir, { version, action, message, prompt, changes, validation });
-  writeSession(dir, {
-    version,
-    title,
-    history,
-    conversation,
-    head: commit.commitId,
-    workflow: { ...(workflow || {}), state: "idle", editMode: workflow?.editMode, validation: workflow?.validation },
-  });
-  return commit;
-}
-
 /* ---------- HTTP 路由 ---------- */
+const generationManager = createGenerationManager({
+  tasksDir: TASKS_DIR,
+  concurrency: GENERATION_CONCURRENCY,
+  maxRetries: GENERATION_MAX_RETRIES,
+  ttl: GENERATION_TTL,
+  createId: genId,
+  execute: handleGenerate,
+});
+const generationJobs = generationManager.jobs;
+const { persist: persistGenerationJob, create: createGenerationJob, enqueue: enqueueGenerationJob, cancel: cancelGenerationJob, summary: generationSummary } = generationManager;
+const handleAppRoutes = createAppRoutes({ appsDir: APPS_DIR, baseUrl: BASE_URL, checkAuth, sendJson, clientIp, listApps, withAppLock, backupBundleFiles, atomicWriteFiles, readSession, readVersionHistory, recordVersion, extractTitle, validateGeneratedHtml, genManifest, genIcon });
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1:" + PORT);
   const p = url.pathname;
@@ -1072,155 +690,7 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  // 应用列表（需口令）
-  if (req.method === "GET" && p === "/api/apps") {
-    const authErr = checkAuth(req);
-    if (authErr) return sendJson(res, 401, { error: authErr });
-    return sendJson(res, 200, { apps: listApps() });
-  }
-  const patchMatch = p.match(/^\/api\/apps\/([a-z0-9]+)\/patch$/i);
-  if (req.method === "POST" && patchMatch) {
-    const authErr = checkAuth(req);
-    if (authErr) return sendJson(res, 401, { error: authErr });
-    const id = patchMatch[1];
-    const dir = path.join(APPS_DIR, id);
-    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
-    let bodyText = "";
-    req.on("data", (chunk) => { bodyText += chunk; if (bodyText.length > 2e6) req.destroy(); });
-    req.on("end", async () => {
-      try {
-        const body = JSON.parse(bodyText);
-        if (!Array.isArray(body.patches) || !body.patches.length) return sendJson(res, 400, { error: "patches 不能为空" });
-        await withAppLock(id, "patch", async () => {
-          const files = {};
-          for (const patch of body.patches) {
-            const safePath = assertSafeBundlePath(patch.path);
-            const filePath = path.join(dir, safePath);
-            if (!filePath.startsWith(dir) || !fs.existsSync(filePath)) throw new Error("文件不存在：" + safePath);
-            files[safePath] = fs.readFileSync(filePath, "utf8");
-          }
-          const beforeBundle = { entry: "index.html", files };
-          const patched = applySearchReplace(beforeBundle, body.patches);
-          if (!patched.files["index.html"]) throw new Error("Patch 必须包含 index.html");
-          const validationError = validateGeneratedHtml(patched.files["index.html"]);
-          if (validationError) throw new Error(validationError);
-          const changes = summarizeBundleChanges(beforeBundle, patched);
-          if (!changes.length) throw new Error("Patch 没有产生实际变化");
-          const sessionPath = path.join(dir, "session.json");
-          let version = 1;
-          let history = [];
-          let conversation = [];
-          if (fs.existsSync(sessionPath)) {
-            try {
-              const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
-              version = session.version || 1;
-              history = Array.isArray(session.history) ? session.history : [];
-              conversation = Array.isArray(session.conversation) ? session.conversation : [];
-            } catch {}
-          }
-          backupBundleFiles(dir, changes.map((item) => item.path), version);
-          atomicWriteFiles(dir, patched.files);
-          const newVersion = version + 1;
-          const title = extractTitle(patched.files["index.html"]);
-          const patchConversation = [...conversation, { role: "user", content: "应用增量 Patch：" + changes.map((item) => item.path).join(", "), kind: "message", createdAt: new Date().toISOString() }, { role: "assistant", content: "✅ 已完成：Patch 校验、Diff、版本快照并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() }].slice(-160);
-          const commit = recordVersion(dir, {
-            version: newVersion,
-            action: "patch",
-            message: "应用 Patch：" + changes.map((item) => item.path).join(", "),
-            changes,
-            validation: "passed",
-          });
-          fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation: patchConversation, head: commit.commitId, workflow: { editMode: "patch", validation: "passed", changes, state: "idle" } }));
-          return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, changes, url: BASE_URL + "/apps/" + id + "/" });
-        });
-      } catch (error) {
-        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
-      }
-    });
-    return;
-  }
-  // 应用详情（需口令，含历史，用于恢复会话）
-  const delMatch = p.match(/^\/api\/apps\/([a-z0-9]+)$/i);
-  if (req.method === "GET" && delMatch) {
-    const authErr = checkAuth(req);
-    if (authErr) return sendJson(res, 401, { error: authErr });
-    const id = delMatch[1];
-    const dir = path.join(APPS_DIR, id);
-    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
-    let title = "未命名应用", version = 1, updatedAt = null, history = [], conversation = [], workflow = null;
-    const sp = path.join(dir, "session.json");
-    if (fs.existsSync(sp)) {
-      try {
-        const sj = JSON.parse(fs.readFileSync(sp, "utf8"));
-        if (sj.title) title = sj.title;
-        if (typeof sj.version === "number") version = sj.version;
-        if (sj.updatedAt) updatedAt = sj.updatedAt;
-        if (Array.isArray(sj.history)) history = sj.history;
-        if (Array.isArray(sj.conversation)) conversation = sj.conversation;
-        if (sj.workflow) workflow = sj.workflow;
-      } catch {}
-    }
-    if (!title || title === "未命名应用") {
-      try { title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8")); } catch {}
-    }
-    const versionHistory = readVersionHistory(dir);
-    return sendJson(res, 200, { app: { id, title, version, versions: versionHistory.length, updatedAt, history, conversation, workflow, head: versionHistory[versionHistory.length - 1]?.commitId || null, versionHistory, url: BASE_URL + "/apps/" + id + "/" } });
-  }
-  // 删除应用（需口令）
-  if (req.method === "DELETE" && delMatch) {
-    const authErr = checkAuth(req);
-    if (authErr) return sendJson(res, 401, { error: authErr });
-    const id = delMatch[1];
-    const dir = path.join(APPS_DIR, id);
-    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(dir)) return sendJson(res, 404, { error: "应用不存在" });
-    fs.rmSync(dir, { recursive: true, force: true });
-    console.log("[" + new Date().toISOString() + "] 删除 " + id + " · ip=" + clientIp(req));
-    return sendJson(res, 200, { ok: true });
-  }
-  // 回退到上一版（需口令）
-  const rbMatch = p.match(/^\/api\/apps\/([a-z0-9]+)\/rollback$/i);
-  if (req.method === "POST" && rbMatch) {
-    const authErr = checkAuth(req);
-    if (authErr) return sendJson(res, 401, { error: authErr });
-    const id = rbMatch[1];
-    const dir = path.join(APPS_DIR, id);
-    if (!dir.startsWith(APPS_DIR) || !fs.existsSync(dir)) return sendJson(res, 404, { error: "应用不存在" });
-    (async () => {
-      try {
-        await withAppLock(id, "rollback", async () => {
-          const sessionPath = path.join(dir, "session.json");
-          let version = 1;
-          if (fs.existsSync(sessionPath)) {
-            try { version = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 1; } catch {}
-          }
-          if (version <= 1) return sendJson(res, 400, { error: "没有可回退的版本" });
-          const prevPath = path.join(dir, "versions", "v" + (version - 1) + ".html");
-          if (!prevPath.startsWith(dir) || !fs.existsSync(prevPath)) return sendJson(res, 400, { error: "找不到上一版" });
-          // 当前版也存档（回退可逆）
-          fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
-          fs.copyFileSync(prevPath, path.join(dir, "index.html"));
-          const newVersion = version - 1;
-          const title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8"));
-          fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
-          fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
-          const session = readSession(dir);
-          const commit = recordVersion(dir, {
-            version: newVersion,
-            action: "rollback",
-            message: "回退到版本 v" + newVersion,
-            changes: [{ path: "index.html", changed: true, addedChars: 0, removedChars: 0 }],
-            validation: "not-run",
-          });
-          fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString(), head: commit.commitId, workflow: { ...(session.workflow || {}), state: "idle", validation: { status: "not-run" } } }));
-          console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
-          return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, url: BASE_URL + "/apps/" + id + "/" });
-        });
-      } catch (error) {
-        return sendJson(res, error instanceof Error && (error as any).statusCode ? Number((error as any).statusCode) : 400, { error: error instanceof Error ? error.message : String(error) });
-      }
-    })();
-    return;
-  }
+  if (handleAppRoutes(req, res, p)) return;
   if (req.method === "POST" && p === "/api/generate") {
     let bodyText = "";
     req.on("data", (c) => { bodyText += c; if (bodyText.length > 2e6) req.destroy(); });
@@ -1252,7 +722,7 @@ const server = http.createServer((req, res) => {
 // process entry check must also recognize the stable server.js launcher.
 if (require.main === module || path.basename(process.argv[1] || "") === "server.js") {
   fs.mkdirSync(APPS_DIR, { recursive: true });
-  loadGenerationJobs();
+  generationManager.load();
   server.listen(PORT, "0.0.0.0", () => {
     console.log("Chat2App（云端版）已启动：http://0.0.0.0:" + PORT);
     console.log("公开域名：" + BASE_URL);

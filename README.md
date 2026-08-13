@@ -131,10 +131,15 @@ systemctl reload nginx
 ## 结构
 
 ```
-server.ts            云端后端源码：DeepSeek 流式代理 + PWA 打包 + 发布 + 限流 + 口令
+server.ts            服务入口：配置、通用 HTTP、生成编排、静态资源
 server.js            兼容启动入口，实际运行 dist/server.js
+src/generation-jobs.ts 异步生成任务：队列、重试、取消、SSE 回放、任务持久化
+src/app-store.ts     应用存储：会话、写锁、原子写入、版本历史
+src/app-publisher.ts PWA 产物：manifest、图标、发布、应用列表
+src/app-routes.ts    应用 API：列表、详情、Patch、删除、回滚
 public/              手机聊天界面（PWA：manifest + sw + icon）
 apps-data/<id>/      生成的应用（index.html / manifest.json / sw.js / icon.svg）
+tasks-data/<id>.json 异步生成任务的可恢复状态
 Dockerfile / docker-compose.yml / chat2app.service / nginx.conf.example
 ```
 
