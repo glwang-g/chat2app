@@ -10,6 +10,7 @@ on:
       - 'LICENSE.*'
       - 'license'
       - 'license.*'
+      - '.github/**'
   workflow_dispatch:
 
 permissions:
