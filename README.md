@@ -4,7 +4,7 @@
 
 当前演进状态、Aider / Bolt.diy 借鉴、生产验收和后续计划见：[项目进展与演进路线](docs/PROJECT_STATUS.md)。
 
-移动端聊天 → DeepSeek 流式生成单文件 PWA → 自动发布到 `https://app.freexlib.com/apps/{id}/`，
+移动端聊天 → DeepSeek 流式生成单文件 PWA → 自动发布到 `https://app.freexlib.com/apps/<id>/`，
 **任何人拿到链接都能立即打开**，手机/桌面浏览器可"安装为应用"。
 
 运行时不需要 npm 依赖，构建阶段使用 TypeScript；Node 18+（自带 fetch）。对标 WorkBuddy 的"聊天生成子应用"能力，
@@ -126,7 +126,7 @@ systemctl reload nginx
 ## 验证
 
 - `curl https://app.freexlib.com/api/health` → `{"ok":true,...}`
-- 打开 `https://app.freexlib.com/apps/{id}/` 就是生成的小应用，无需口令，任何人可访问。
+- 打开 `https://app.freexlib.com/apps/<id>/` 就是生成的小应用，无需口令，任何人可访问。
 
 ## 结构
 
