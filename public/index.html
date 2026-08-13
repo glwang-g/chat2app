@@ -143,6 +143,7 @@ const $ = (s) => document.querySelector(s);
 const chat = $("#chat"), input = $("#input"), sendBtn = $("#send");
 let busy = false, token = localStorage.getItem("pw_token") || "";
 let sessionId = null, appVersion = 0, authRequired = false;
+const chatHome = chat.innerHTML;
 
 (async () => {
   try {
@@ -151,7 +152,7 @@ let sessionId = null, appVersion = 0, authRequired = false;
     $("#target").textContent = cfg.baseUrl.replace(/^https?:\/\//, "");
     if (!cfg.hasKey) addMsg("bot err", "⚠️ 服务端还没配置 DeepSeek API Key，请联系管理员。");
     else if (cfg.authRequired && !token) addMsg("bot", "这个工坊开启了访问口令。点右上角 ⚙️ 输入口令后即可使用。");
-    else addMsg("bot", "描述你的第一个需求，我来生成应用的初版；之后继续聊，我会在同一个应用上不断修改，直到你满意。");
+    else if (!localStorage.getItem("chat2app_session")) showNewAppWelcome();
   } catch (e) { addMsg("bot err", "无法连接服务，请刷新重试。"); }
   const saved = localStorage.getItem("chat2app_session");
   if (saved) restoreSession(saved);
@@ -185,6 +186,7 @@ async function restoreSession(id) {
     }
     if (!resp.ok) { localStorage.removeItem("chat2app_session"); return; }
     const { app } = await resp.json();
+    resetChatView();
     sessionId = app.id;
     appVersion = app.version;
     if (Array.isArray(app.conversation) && app.conversation.length) {
@@ -197,6 +199,23 @@ async function restoreSession(id) {
   } catch (e) {
     addMsg("bot err", "恢复会话失败：" + e.message);
   }
+}
+
+function bindExampleButtons() {
+  document.querySelectorAll("#examples button").forEach((b) => {
+    b.addEventListener("click", () => { input.value = b.dataset.ex; input.focus(); });
+  });
+}
+function resetChatView() {
+  chat.innerHTML = chatHome;
+  const full = document.getElementById("pvFull");
+  if (full) full.classList.remove("on");
+  const fullFrame = document.getElementById("pvFullFrame");
+  if (fullFrame) fullFrame.src = "about:blank";
+  bindExampleButtons();
+}
+function showNewAppWelcome() {
+  addMsg("bot", "描述你的第一个需求，我来生成应用的初版；之后继续聊，我会在同一个应用上不断修改，直到你满意。");
 }
 
 function restoreConversation(entries) {
@@ -334,9 +353,7 @@ function renderApps(apps) {
       $("#appsModal").classList.remove("on");
       sessionId = null;
       appVersion = 0;
-      const oldRw = document.getElementById("result");
-      if (oldRw) oldRw.remove();
-      addMsg("bot", "正在恢复「" + a.title + "」的会话…");
+      resetChatView();
       restoreSession(a.id);
     });
     item.querySelector(".open").addEventListener("click", () => window.open(a.url, "_blank"));
@@ -370,9 +387,7 @@ function renderApps(apps) {
   }
 }
 
-document.querySelectorAll("#examples button").forEach((b) => {
-  b.addEventListener("click", () => { input.value = b.dataset.ex; input.focus(); });
-});
+bindExampleButtons();
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
@@ -608,10 +623,9 @@ function showResult(r) {
     sessionId = null;
     appVersion = 0;
     localStorage.removeItem("chat2app_session");
-    const rw = document.getElementById("result");
-    if (rw) rw.remove();
+    resetChatView();
     setInputPlaceholder();
-    addMsg("bot", "好的，开始一个新应用。描述你的需求吧！");
+    showNewAppWelcome();
   });
 }
 function escapeHtml(s) {
