@@ -135,24 +135,53 @@ Bolt.diy 的启发不在于复制 WebContainer、终端、Electron 或多文件 
 
 服务端已经从单个 `server.ts` 拆为“入口编排 + 领域模块”。对外 HTTP API、SSE 事件格式、应用目录和版本文件格式均保持不变。
 
-```text
-用户 PWA
-  │  生成 / 修改 / 管理应用
-  ▼
-server.ts（配置、鉴权限流、HTTP 分发、静态资源、生成编排）
-  ├─ /api/generations → generation-jobs.ts
-  │     队列、并发、重试、取消、SSE 回放、tasks-data 持久化
-  ├─ 生成流水线 → model-adapter.ts → DeepSeek
-  │     上下文裁剪 → 完整 HTML 或 Patch → HTML/JS 校验
-  │     → Chromium 验证 → 一次自动修复 → 发布与版本提交
-  ├─ /api/apps/* → app-routes.ts
-  │     列表、详情、Patch、删除、回滚
-  └─ 应用领域服务
-        ├─ app-store.ts：session、应用锁、原子写入、版本链
-        └─ app-publisher.ts：PWA 文件、发布、应用列表
-                 │
-                 ▼
-       apps-data/<id>/（应用文件、会话、快照、版本历史）
+```mermaid
+flowchart TB
+    User[用户浏览器 / PWA] -->|生成、修改、管理应用| Server
+
+    subgraph Server[server.ts：服务入口与生成编排]
+        Http[HTTP 分发、鉴权、限流]
+        Generate[生成流水线]
+        Static[静态资源与 /apps/:id]
+    end
+
+    Http -->|/api/generations| Jobs
+    Http -->|/api/generate| Generate
+    Http -->|/api/apps/*| AppRoutes
+    User <-->|SSE 进度与任务状态| Jobs
+    User -->|访问已发布应用| Static
+
+    subgraph Jobs[generation-jobs.ts：异步任务]
+        Queue[队列、并发、重试、取消]
+        TaskData[(tasks-data)]
+        Queue <--> TaskData
+    end
+    Jobs --> Generate
+
+    subgraph Flow[生成流水线]
+        Context[历史与上下文裁剪]
+        Model[model-adapter.ts → DeepSeek]
+        Patch[完整 HTML 或 Patch]
+        Check[HTML / JS 校验]
+        Browser[Chromium 验证]
+        Repair[一次自动修复]
+        Context --> Model --> Patch --> Check --> Browser
+        Browser -->|失败| Repair --> Check
+    end
+    Generate --> Context
+    Browser -->|通过| Publisher
+
+    subgraph Domain[应用领域能力]
+        AppRoutes[app-routes.ts：应用管理 API]
+        Store[app-store.ts：会话、写锁、原子写、版本链]
+        Publisher[app-publisher.ts：PWA 文件、发布、应用列表]
+        AppData[(apps-data/:id)]
+        AppRoutes --> Store
+        AppRoutes --> Publisher
+        Store <--> AppData
+        Publisher --> AppData
+    end
+    Static --> AppData
 ```
 
 模块边界：
