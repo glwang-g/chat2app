@@ -6,6 +6,10 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
+      - 'LICENSE'
+      - 'LICENSE.*'
+      - 'license'
+      - 'license.*'
   workflow_dispatch:
 
 permissions:
