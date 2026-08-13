@@ -1,5 +1,5 @@
 {
-  "baseUrl": "https://freexlib.com",
+  "baseUrl": "https://app.freexlib.com",
   "model": "deepseek-v4-flash",
   "deepseekUrl": "https://api.deepseek.com/chat/completions",
   "apiToken": "",
