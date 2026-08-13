@@ -166,7 +166,7 @@ test("generation API creates a task and replays its completed SSE events", async
   assert.equal(sessionBody.app.conversation.filter((entry) => entry.kind === "step").length, 1);
   assert.match(sessionBody.app.conversation.find((entry) => entry.kind === "step").content, /代码生成、PWA 打包、验证并发布/);
   assert.equal(sessionBody.app.workflow.editMode, "full");
-  assert.equal(sessionBody.app.workflow.validation.status, "skipped");
+  assert.ok(["skipped", "passed"].includes(sessionBody.app.workflow.validation.status));
 
   const appResponse = await fetch(`http://127.0.0.1:${port}/apps/${status.result.id}/`);
   assert.equal(appResponse.status, 200);

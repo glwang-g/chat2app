@@ -258,6 +258,7 @@ function checkAuth(req) {
 const rateMap = new Map();
 const generationJobs = new Map();
 const generationQueue = [];
+const appLocks = new Map();
 let activeGenerations = 0;
 const GENERATION_TTL = 30 * 60 * 1000;
 const GENERATION_CONCURRENCY = Math.max(1, Number(process.env.GENERATION_CONCURRENCY || config.generationConcurrency || 2));
@@ -315,6 +316,43 @@ function readSession(dir) {
     const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
     return session && typeof session === "object" ? session : {};
   } catch { return {}; }
+}
+
+function writeSession(dir, patch) {
+  if (!dir || !fs.existsSync(dir)) return;
+  const sessionPath = path.join(dir, "session.json");
+  const session = readSession(dir);
+  fs.writeFileSync(sessionPath, JSON.stringify({ ...session, ...patch, updatedAt: new Date().toISOString() }));
+}
+
+function updateSessionWorkflow(dir, patch) {
+  const session = readSession(dir);
+  const workflow = { ...(session.workflow || {}), ...patch };
+  writeSession(dir, { workflow });
+}
+
+function acquireAppLock(id, action) {
+  const current = appLocks.get(id);
+  if (current) {
+    const error = new Error(`应用 ${id} 正在执行 ${current.action}，请稍后重试`);
+    (error as any).statusCode = 409;
+    throw error;
+  }
+  const lock = { action, startedAt: new Date().toISOString() };
+  appLocks.set(id, lock);
+  return () => {
+    const existing = appLocks.get(id);
+    if (existing && existing.action === action && existing.startedAt === lock.startedAt) appLocks.delete(id);
+  };
+}
+
+async function withAppLock(id, action, fn) {
+  const release = acquireAppLock(id, action);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 function conversationFromEvents(events, prompt) {
@@ -627,12 +665,14 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   const sessionId = (body.sessionId || "").trim();
   let isIteration = false;
   let existingHtml = null;
+  let targetId = null;
   if (sessionId) {
     if (!/^[a-z0-9]+$/i.test(sessionId)) return sendJson(res, 400, { error: "无效的会话" });
     const existingPath = path.join(APPS_DIR, sessionId, "index.html");
     if (existingPath.startsWith(APPS_DIR) && fs.existsSync(existingPath)) {
       isIteration = true;
       existingHtml = fs.readFileSync(existingPath, "utf8");
+      targetId = sessionId;
     } else {
       return sendJson(res, 400, { error: "会话不存在，请重新开始" });
     }
@@ -724,91 +764,114 @@ async function handleGenerate(req, res, bodyText, ip, skipAccess = false, signal
   const appDir = path.join(APPS_DIR, id);
   fs.mkdirSync(appDir, { recursive: true });
 
-  // 版本管理：迭代前把当前版本备份到 versions/
-  const sessionPath = path.join(appDir, "session.json");
-  let curVersion = 0;
-  if (fs.existsSync(sessionPath)) {
-    try { curVersion = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 0; } catch {}
-  }
-  const newVersion = curVersion + 1;
-  if (isIteration && curVersion > 0) {
-    const vDir = path.join(appDir, "versions");
-    fs.mkdirSync(vDir, { recursive: true });
-    fs.copyFileSync(path.join(appDir, "index.html"), path.join(vDir, "v" + curVersion + ".html"));
-  }
-  const files = ["index.html", "manifest.json", "sw.js", "icon.svg"];
-  fs.writeFileSync(path.join(appDir, "index.html"), bundle.files["index.html"]);
-  fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
-  fs.writeFileSync(path.join(appDir, "sw.js"), SW_JS);
-  fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
-  const savedHistory = isIteration ? [...history, prompt].slice(-20) : [prompt];
-  // 会话文件在全部发布步骤完成后写入，确保恢复时能看到完整过程。
-  console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
-
-  sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
-  if (BROWSER_VALIDATION) {
-    sse({ type: "status", text: "正在用无头浏览器验证…" });
-    let validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
-    if (!validation.ok) {
-      sse({ type: "validation", status: "failed", errors: validation.errors, interactions: validation.interactions || [] });
-      sse({ type: "status", text: "验证发现问题，正在自动修复…" });
-      try {
-        sse({ type: "repair", status: "started", errors: validation.errors });
-        const repairedHtml = await requestRepairHtml(html, validation.errors, signal, prompt, history);
-        const repairError = validateGeneratedHtml(repairedHtml);
-        if (repairError) throw new Error(repairError);
-        html = repairedHtml;
-        title = extractTitle(html);
-        bundle = bundleFromHtml(html);
-        fs.writeFileSync(path.join(appDir, "index.html"), bundle.files["index.html"]);
-        fs.writeFileSync(path.join(appDir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
-        fs.writeFileSync(path.join(appDir, "icon.svg"), genIcon(title));
-        sse({ type: "step", icon: "🔧", text: "已根据浏览器错误自动修复" });
-        validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
-        sse({ type: "repair", status: validation.ok ? "passed" : "failed", errors: validation.errors, interactions: validation.interactions || [] });
-      } catch (repairError) {
-        const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
-        sse({ type: "repair", status: "failed", errors: [repairMessage] });
-        appendSessionConversation(appDir, failureConversation(prompt, timeline, "浏览器验证失败，自动修复也未通过：" + repairMessage));
-        sse({ type: "error", message: "浏览器验证失败，自动修复也未通过：" + (repairError instanceof Error ? repairError.message : String(repairError)) });
-        res.end();
-        return;
-      }
-      if (!validation.ok) {
-        appendSessionConversation(appDir, failureConversation(prompt, timeline, "自动修复后浏览器验证仍失败：" + validation.errors.join("；")));
-        sse({ type: "failure", phase: "browser-validation", errors: validation.errors, interactions: validation.interactions || [] });
-        sse({ type: "error", message: "自动修复后浏览器验证仍失败：" + validation.errors.join("；") });
-        res.end();
-        return;
-      }
+  try {
+    await withAppLock(id, isIteration ? "iterate" : "create", async () => {
+    // 版本管理：迭代前把当前版本备份到 versions/
+    const sessionPath = path.join(appDir, "session.json");
+    const previousSession = readSession(appDir);
+    const previousConversation = Array.isArray(previousSession.conversation) ? previousSession.conversation : [];
+    let curVersion = 0;
+    if (fs.existsSync(sessionPath)) {
+      try { curVersion = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 0; } catch {}
     }
-    if (validation.skipped) sse({ type: "step", icon: "ℹ️", text: "未配置浏览器，跳过无头验证" });
-    else sse({ type: "step", icon: "🧪", text: "浏览器验证通过" });
+    const newVersion = curVersion + 1;
+    const files = ["index.html", "manifest.json", "sw.js", "icon.svg"];
+    const savedHistory = isIteration ? [...history, prompt].slice(-20) : [prompt];
+    if (isIteration && curVersion > 0) {
+      backupBundleFiles(appDir, ["index.html"], curVersion);
+    }
+    atomicWriteFiles(appDir, {
+      "index.html": bundle.files["index.html"],
+      "manifest.json": JSON.stringify(genManifest(title, "#4f8cff"), null, 2),
+      "sw.js": SW_JS,
+      "icon.svg": genIcon(title),
+    });
+    writeSession(appDir, {
+      version: newVersion,
+      title,
+      history: savedHistory,
+      conversation: [...previousConversation, ...conversationFromEvents(timeline, prompt)].slice(-120),
+      workflow: { context: contextPlan, editMode: parsedOutput.mode, validation: { status: BROWSER_VALIDATION ? "pending" : "skipped" }, state: "validating" },
+    });
+    console.log("[" + new Date().toISOString() + "] " + (isIteration ? "迭代" : "生成") + " " + id + " · " + title + " · v" + newVersion + " · ip=" + ip);
+
+    sse({ type: "step", icon: "📦", text: "已打包 PWA（页面 / manifest / 图标 / 离线缓存）" });
+    let validation = { ok: true, skipped: true, errors: [], interactions: [] };
+    if (BROWSER_VALIDATION) {
+      sse({ type: "status", text: "正在用无头浏览器验证…" });
+      validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
+      if (!validation.ok) {
+        sse({ type: "validation", status: "failed", errors: validation.errors, interactions: validation.interactions || [] });
+        sse({ type: "status", text: "验证发现问题，正在自动修复…" });
+        try {
+          sse({ type: "repair", status: "started", errors: validation.errors });
+          const repairedHtml = await requestRepairHtml(html, validation.errors, signal, prompt, history);
+          const repairError = validateGeneratedHtml(repairedHtml);
+          if (repairError) throw new Error(repairError);
+          html = repairedHtml;
+          title = extractTitle(html);
+          bundle = bundleFromHtml(html);
+          atomicWriteFiles(appDir, {
+            "index.html": bundle.files["index.html"],
+            "manifest.json": JSON.stringify(genManifest(title, "#4f8cff"), null, 2),
+            "icon.svg": genIcon(title),
+          });
+          sse({ type: "step", icon: "🔧", text: "已根据浏览器错误自动修复" });
+          validation = await validateInBrowser(BASE_URL + "/apps/" + id + "/?validation=" + Date.now(), BROWSER_EXECUTABLE, BROWSER_INTERACTIONS);
+          sse({ type: "repair", status: validation.ok ? "passed" : "failed", errors: validation.errors, interactions: validation.interactions || [] });
+        } catch (repairError) {
+          const repairMessage = repairError instanceof Error ? repairError.message : String(repairError);
+          sse({ type: "repair", status: "failed", errors: [repairMessage] });
+          appendSessionConversation(appDir, failureConversation(prompt, timeline, "浏览器验证失败，自动修复也未通过：" + repairMessage));
+          sse({ type: "error", message: "浏览器验证失败，自动修复也未通过：" + (repairError instanceof Error ? repairError.message : String(repairError)) });
+          res.end();
+          return;
+        }
+        if (!validation.ok) {
+          appendSessionConversation(appDir, failureConversation(prompt, timeline, "自动修复后浏览器验证仍失败：" + validation.errors.join("；")));
+          sse({ type: "failure", phase: "browser-validation", errors: validation.errors, interactions: validation.interactions || [] });
+          sse({ type: "error", message: "自动修复后浏览器验证仍失败：" + validation.errors.join("；") });
+          res.end();
+          return;
+        }
+      }
+      if (validation.skipped) sse({ type: "step", icon: "ℹ️", text: "未配置浏览器，跳过无头验证" });
+      else sse({ type: "step", icon: "🧪", text: "浏览器验证通过" });
+    }
+    const deployFiles = ["index.html", "manifest.json", "sw.js", "icon.svg"];
+    const result = await deploy(id, deployFiles);
+    sse({ type: "step", icon: "⬆️", text: "已发布：" + BASE_URL + "/apps/" + id + "/" });
+    const commit = finalizeAppCommit(appDir, {
+      version: newVersion,
+      title,
+      history: savedHistory,
+      conversation: [...previousConversation, ...conversationFromEvents(timeline, prompt)].slice(-120),
+      workflow: { context: contextPlan, editMode: parsedOutput.mode, validation: BROWSER_VALIDATION ? { status: validation.ok ? "passed" : "failed", browser: BROWSER_EXECUTABLE } : { status: "skipped" } },
+      action: isIteration ? "iterate" : "create",
+      message: isIteration ? "迭代应用：" + shortPrompt : "创建应用：" + title,
+      prompt,
+      changes: [{ path: "index.html", changed: true, addedChars: html.length, removedChars: isIteration && existingHtml ? existingHtml.length : 0 }],
+      validation: BROWSER_VALIDATION ? { status: validation.ok ? "passed" : "failed", browser: BROWSER_EXECUTABLE } : { status: "skipped" },
+    });
+    writeSession(appDir, {
+      head: commit.commitId,
+      workflow: { context: contextPlan, editMode: parsedOutput.mode, validation: BROWSER_VALIDATION ? { status: validation.ok ? "passed" : "failed", browser: BROWSER_EXECUTABLE } : { status: "skipped" }, state: "idle" },
+    });
+      sse({
+        type: "done",
+        result: {
+          id, sessionId: id, title, version: newVersion, isIteration,
+          feedback,
+          changes: feedback || extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
+          url: BASE_URL + "/apps/" + id + "/",
+          files, deploy: result,
+        },
+      });
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    sse({ type: "error", message });
   }
-  const result = await deploy(id, files);
-  sse({ type: "step", icon: "⬆️", text: "已发布：" + BASE_URL + "/apps/" + id + "/" });
-  sse({
-    type: "done",
-    result: {
-      id, sessionId: id, title, version: newVersion, isIteration,
-      feedback,
-      changes: feedback || extractChanges(html) || (isIteration ? "按你的要求更新：「" + shortPrompt + "」" : "创建了「" + title + "」应用"),
-      url: BASE_URL + "/apps/" + id + "/",
-      files, deploy: result,
-      },
-  });
-  const previousSession = readSession(appDir);
-  const previousConversation = Array.isArray(previousSession.conversation) ? previousSession.conversation : [];
-  const conversation = [...previousConversation, ...conversationFromEvents(timeline, prompt)].slice(-120);
-  const commit = recordVersion(appDir, {
-    version: newVersion,
-    action: isIteration ? "iterate" : "create",
-    message: isIteration ? "迭代应用：" + shortPrompt : "创建应用：" + title,
-    prompt,
-    changes: [{ path: "index.html", changed: true, addedChars: html.length, removedChars: isIteration && existingHtml ? existingHtml.length : 0 }],
-    validation: BROWSER_VALIDATION ? { status: "passed", browser: BROWSER_EXECUTABLE } : { status: "skipped" },
-  });
-  fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: savedHistory, conversation, head: commit.commitId, workflow: { context: contextPlan, editMode: parsedOutput.mode, validation: commit.validation } }));
   res.end();
 }
 
@@ -916,6 +979,19 @@ function recordVersion(dir, { version, action, message, prompt = null, changes =
   return entry;
 }
 
+function finalizeAppCommit(dir, { version, title, history, conversation, workflow, action, message, prompt = null, changes = [], validation = null }) {
+  const commit = recordVersion(dir, { version, action, message, prompt, changes, validation });
+  writeSession(dir, {
+    version,
+    title,
+    history,
+    conversation,
+    head: commit.commitId,
+    workflow: { ...(workflow || {}), state: "idle", editMode: workflow?.editMode, validation: workflow?.validation },
+  });
+  return commit;
+}
+
 /* ---------- HTTP 路由 ---------- */
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1:" + PORT);
@@ -1011,50 +1087,52 @@ const server = http.createServer((req, res) => {
     if (!dir.startsWith(APPS_DIR) || !fs.existsSync(path.join(dir, "index.html"))) return sendJson(res, 404, { error: "应用不存在" });
     let bodyText = "";
     req.on("data", (chunk) => { bodyText += chunk; if (bodyText.length > 2e6) req.destroy(); });
-    req.on("end", () => {
+    req.on("end", async () => {
       try {
         const body = JSON.parse(bodyText);
         if (!Array.isArray(body.patches) || !body.patches.length) return sendJson(res, 400, { error: "patches 不能为空" });
-        const files = {};
-        for (const patch of body.patches) {
-          const safePath = assertSafeBundlePath(patch.path);
-          const filePath = path.join(dir, safePath);
-          if (!filePath.startsWith(dir) || !fs.existsSync(filePath)) throw new Error("文件不存在：" + safePath);
-          files[safePath] = fs.readFileSync(filePath, "utf8");
-        }
-        const beforeBundle = { entry: "index.html", files };
-        const patched = applySearchReplace(beforeBundle, body.patches);
-        if (!patched.files["index.html"]) throw new Error("Patch 必须包含 index.html");
-        const validationError = validateGeneratedHtml(patched.files["index.html"]);
-        if (validationError) throw new Error(validationError);
-        const changes = summarizeBundleChanges(beforeBundle, patched);
-        if (!changes.length) throw new Error("Patch 没有产生实际变化");
-        const sessionPath = path.join(dir, "session.json");
-        let version = 1;
-        let history = [];
-        let conversation = [];
-        if (fs.existsSync(sessionPath)) {
-          try {
-            const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
-            version = session.version || 1;
-            history = Array.isArray(session.history) ? session.history : [];
-            conversation = Array.isArray(session.conversation) ? session.conversation : [];
-          } catch {}
-        }
-        backupBundleFiles(dir, changes.map((item) => item.path), version);
-        atomicWriteFiles(dir, patched.files);
-        const newVersion = version + 1;
-        const title = extractTitle(patched.files["index.html"]);
-        const patchConversation = [...conversation, { role: "user", content: "应用增量 Patch：" + changes.map((item) => item.path).join(", "), kind: "message", createdAt: new Date().toISOString() }, { role: "assistant", content: "✅ 已完成：Patch 校验、Diff、版本快照并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() }].slice(-160);
-        const commit = recordVersion(dir, {
-          version: newVersion,
-          action: "patch",
-          message: "应用 Patch：" + changes.map((item) => item.path).join(", "),
-          changes,
-          validation: "passed",
+        await withAppLock(id, "patch", async () => {
+          const files = {};
+          for (const patch of body.patches) {
+            const safePath = assertSafeBundlePath(patch.path);
+            const filePath = path.join(dir, safePath);
+            if (!filePath.startsWith(dir) || !fs.existsSync(filePath)) throw new Error("文件不存在：" + safePath);
+            files[safePath] = fs.readFileSync(filePath, "utf8");
+          }
+          const beforeBundle = { entry: "index.html", files };
+          const patched = applySearchReplace(beforeBundle, body.patches);
+          if (!patched.files["index.html"]) throw new Error("Patch 必须包含 index.html");
+          const validationError = validateGeneratedHtml(patched.files["index.html"]);
+          if (validationError) throw new Error(validationError);
+          const changes = summarizeBundleChanges(beforeBundle, patched);
+          if (!changes.length) throw new Error("Patch 没有产生实际变化");
+          const sessionPath = path.join(dir, "session.json");
+          let version = 1;
+          let history = [];
+          let conversation = [];
+          if (fs.existsSync(sessionPath)) {
+            try {
+              const session = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+              version = session.version || 1;
+              history = Array.isArray(session.history) ? session.history : [];
+              conversation = Array.isArray(session.conversation) ? session.conversation : [];
+            } catch {}
+          }
+          backupBundleFiles(dir, changes.map((item) => item.path), version);
+          atomicWriteFiles(dir, patched.files);
+          const newVersion = version + 1;
+          const title = extractTitle(patched.files["index.html"]);
+          const patchConversation = [...conversation, { role: "user", content: "应用增量 Patch：" + changes.map((item) => item.path).join(", "), kind: "message", createdAt: new Date().toISOString() }, { role: "assistant", content: "✅ 已完成：Patch 校验、Diff、版本快照并发布", kind: "step", icon: "✅", createdAt: new Date().toISOString() }].slice(-160);
+          const commit = recordVersion(dir, {
+            version: newVersion,
+            action: "patch",
+            message: "应用 Patch：" + changes.map((item) => item.path).join(", "),
+            changes,
+            validation: "passed",
+          });
+          fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation: patchConversation, head: commit.commitId, workflow: { editMode: "patch", validation: "passed", changes, state: "idle" } }));
+          return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, changes, url: BASE_URL + "/apps/" + id + "/" });
         });
-        fs.writeFileSync(sessionPath, JSON.stringify({ version: newVersion, title, updatedAt: new Date().toISOString(), history: [...history, "应用 Patch：" + changes.map((item) => item.path).join(", ")].slice(-20), conversation: patchConversation, head: commit.commitId, workflow: { editMode: "patch", validation: "passed", changes } }));
-        return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, changes, url: BASE_URL + "/apps/" + id + "/" });
       } catch (error) {
         return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -1107,32 +1185,41 @@ const server = http.createServer((req, res) => {
     const id = rbMatch[1];
     const dir = path.join(APPS_DIR, id);
     if (!dir.startsWith(APPS_DIR) || !fs.existsSync(dir)) return sendJson(res, 404, { error: "应用不存在" });
-    const sessionPath = path.join(dir, "session.json");
-    let version = 1;
-    if (fs.existsSync(sessionPath)) {
-      try { version = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 1; } catch {}
-    }
-    if (version <= 1) return sendJson(res, 400, { error: "没有可回退的版本" });
-    const prevPath = path.join(dir, "versions", "v" + (version - 1) + ".html");
-    if (!prevPath.startsWith(dir) || !fs.existsSync(prevPath)) return sendJson(res, 400, { error: "找不到上一版" });
-    // 当前版也存档（回退可逆）
-    fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
-    fs.copyFileSync(prevPath, path.join(dir, "index.html"));
-    const newVersion = version - 1;
-    const title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8"));
-    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
-    fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
-    const session = readSession(dir);
-    const commit = recordVersion(dir, {
-      version: newVersion,
-      action: "rollback",
-      message: "回退到版本 v" + newVersion,
-      changes: [{ path: "index.html", changed: true, addedChars: 0, removedChars: 0 }],
-      validation: "not-run",
-    });
-    fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString(), head: commit.commitId }));
-    console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
-    return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, url: BASE_URL + "/apps/" + id + "/" });
+    (async () => {
+      try {
+        await withAppLock(id, "rollback", async () => {
+          const sessionPath = path.join(dir, "session.json");
+          let version = 1;
+          if (fs.existsSync(sessionPath)) {
+            try { version = JSON.parse(fs.readFileSync(sessionPath, "utf8")).version || 1; } catch {}
+          }
+          if (version <= 1) return sendJson(res, 400, { error: "没有可回退的版本" });
+          const prevPath = path.join(dir, "versions", "v" + (version - 1) + ".html");
+          if (!prevPath.startsWith(dir) || !fs.existsSync(prevPath)) return sendJson(res, 400, { error: "找不到上一版" });
+          // 当前版也存档（回退可逆）
+          fs.copyFileSync(path.join(dir, "index.html"), path.join(dir, "versions", "v" + version + ".html"));
+          fs.copyFileSync(prevPath, path.join(dir, "index.html"));
+          const newVersion = version - 1;
+          const title = extractTitle(fs.readFileSync(path.join(dir, "index.html"), "utf8"));
+          fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify(genManifest(title, "#4f8cff"), null, 2));
+          fs.writeFileSync(path.join(dir, "icon.svg"), genIcon(title));
+          const session = readSession(dir);
+          const commit = recordVersion(dir, {
+            version: newVersion,
+            action: "rollback",
+            message: "回退到版本 v" + newVersion,
+            changes: [{ path: "index.html", changed: true, addedChars: 0, removedChars: 0 }],
+            validation: "not-run",
+          });
+          fs.writeFileSync(sessionPath, JSON.stringify({ ...session, version: newVersion, title, updatedAt: new Date().toISOString(), head: commit.commitId, workflow: { ...(session.workflow || {}), state: "idle", validation: { status: "not-run" } } }));
+          console.log("[" + new Date().toISOString() + "] 回退 " + id + " · " + title + " · v" + newVersion + " · ip=" + clientIp(req));
+          return sendJson(res, 200, { ok: true, id, version: newVersion, title, commit, url: BASE_URL + "/apps/" + id + "/" });
+        });
+      } catch (error) {
+        return sendJson(res, error instanceof Error && (error as any).statusCode ? Number((error as any).statusCode) : 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    })();
+    return;
   }
   if (req.method === "POST" && p === "/api/generate") {
     let bodyText = "";
