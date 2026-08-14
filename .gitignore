@@ -3,3 +3,4 @@ apps-data/
 tasks-data/
 .env
 dist/
+.understand-anything/
