@@ -11,6 +11,7 @@ on:
       - 'license'
       - 'license.*'
       - '.github/**'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions:
